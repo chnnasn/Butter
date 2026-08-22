@@ -1,4 +1,4 @@
-foreach(example_name hello_butter falling_boxes chain playground)
+foreach(example_name hello_butter falling_boxes chain playground physics2d_playground)
     add_executable(${example_name} ${example_name}.cpp)
     target_link_libraries(${example_name} PRIVATE butter)
 endforeach()

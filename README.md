@@ -78,6 +78,8 @@ ctest --test-dir build --output-on-failure
 - `butter/math` - Vectors, matrices, quaternions, transforms, AABB
 - `butter/core` - World, body, builder, material, events
 - `butter/shapes` - Sphere, box, capsule, convex, indexed mesh, collision detection
+- `butter/physics2d` - 2D circle, box, polygon, gravity and impulse contacts
+- `butter/physics3d` - Explicit 3D facade over the existing Butter API
 - `butter/constraints` - Distance, spring, hinge joints
 - `butter/query` - Raycast and overlap queries
 
@@ -159,6 +161,28 @@ cmake --build build --config Release --target exploding_crates
 
 The demo settles a gravity-driven stack before an automatic blast. Press
 `Space` to repeat the blast, `R` to reset, and `P` to pause.
+
+## 2D module
+
+The 2D API lives beside the 3D API under `butter::physics2d`, so it can be
+adopted without changing existing 3D code:
+
+```cpp
+#include <butter/physics2d/butter2d.h>
+using namespace butter::physics2d;
+
+World world;
+world.create_body().static_body().at(0, -1).box(20, 1).build();
+auto& ball = world.create_body().dynamic().at(0, 5).circle(0.5f).build();
+for (int i = 0; i < 120; ++i) world.step();
+```
+
+The 2D module includes circle, box, capsule, convex polygon and indexed
+triangle mesh narrow phase, spatial-hash broadphase, PBD/impulse projection,
+friction, angular motion, sleeping, collision filtering, enter/exit triggers,
+raycast/AABB queries, distance constraints and a `physics2d_playground`
+example. `bench_2d` measures a 100-body stack. CCD and a dedicated internal
+mesh BVH remain future optimizations.
 
 ## Examples
 

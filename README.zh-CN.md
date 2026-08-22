@@ -78,6 +78,8 @@ ctest --test-dir build --output-on-failure
 - `butter/math` - 向量、矩阵、四元数、变换、包围盒
 - `butter/core` - 世界、刚体、Builder、材质、事件
 - `butter/shapes` - 球、盒、胶囊、凸包、索引网格与碰撞检测
+- `butter/physics2d` - 2D 圆、盒、多边形、重力与冲量接触
+- `butter/physics3d` - 现有 3D Butter API 的显式入口
 - `butter/constraints` - 距离、弹簧、铰链关节
 - `butter/query` - 射线检测与重叠查询
 
@@ -155,6 +157,26 @@ cmake --build build --config Release --target exploding_crates
 
 示例会先让受重力影响的箱子堆稳定，再自动施加爆炸冲量；按 `Space` 重复
 爆炸，`R` 重置，`P` 暂停。
+
+## 2D 模块
+
+2D API 位于 `butter::physics2d`，与 3D API 并列，不会改变现有 3D 代码：
+
+```cpp
+#include <butter/physics2d/butter2d.h>
+using namespace butter::physics2d;
+
+World world;
+world.create_body().static_body().at(0, -1).box(20, 1).build();
+auto& ball = world.create_body().dynamic().at(0, 5).circle(0.5f).build();
+for (int i = 0; i < 120; ++i) world.step();
+```
+
+当前 2D 模块包含圆、盒、胶囊、凸多边形和索引三角网格窄相位，
+spatial-hash broadphase、PBD/冲量投影、摩擦、角运动、睡眠、碰撞过滤、
+enter/exit trigger、raycast/AABB 查询、距离约束，以及
+`physics2d_playground` 示例。`bench_2d` 会测量 100 刚体堆叠性能；CCD 和
+专用网格内部 BVH 仍属于后续优化。
 
 ## 示例
 

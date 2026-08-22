@@ -34,3 +34,6 @@
 #include "butter/query/overlap.h"
 
 #include "butter/core/world.h"
+
+// Optional 2D module (kept in the physics2d namespace).
+#include "butter/physics2d/butter2d.h"
