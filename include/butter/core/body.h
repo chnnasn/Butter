@@ -84,6 +84,7 @@ public:
     Body& set_sleeping(bool sleeping) {
         if (sleeping_ == sleeping) return *this;
         sleeping_ = sleeping;
+        if (!sleeping_) sleep_time_ = 0.0f;
         if (sleeping_) {
             if (on_sleep) on_sleep();
         } else {
@@ -199,6 +200,7 @@ private:
     math::Vec3 force_accumulator_{};
     math::Vec3 torque_accumulator_{};
     bool sleeping_{false};
+    float sleep_time_{0.0f};
     bool gravity_enabled_{true};
     bool destroyed_{false};
     std::string name_;

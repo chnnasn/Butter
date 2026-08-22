@@ -48,6 +48,31 @@ int main() {
     }
 
     {
+        // Ray queries use the finite capsule (cylinder + hemispherical caps),
+        // not a large sphere around its midpoint. The first ray passes
+        // through an empty side corner that the old midpoint approximation
+        // incorrectly reported as a hit; the second crosses the true barrel.
+        World world;
+        world.create_body()
+            .static_body()
+            .capsule(0.5f, 4.0f)
+            .build();
+
+        const auto empty_corner = world.raycast({1.2f, 0.0f, -5.0f},
+                                                {0, 0, 1}, 10.0f);
+        check(!empty_corner.has_value(),
+              "raycast rejects the empty corner of a long capsule");
+        const auto barrel = world.raycast({0.0f, 0.0f, -5.0f},
+                                          {0, 0, 1}, 10.0f);
+        check(barrel.has_value() && barrel->hit,
+              "raycast hits the finite capsule barrel");
+        if (barrel) {
+            check(std::abs(barrel->distance - 4.5f) < 1.0e-3f,
+                  "capsule barrel hit distance");
+        }
+    }
+
+    {
         World world;
         world.create_body()
             .static_body()

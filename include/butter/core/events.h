@@ -25,7 +25,19 @@ struct CollisionEvent {
 struct TriggerEvent {
     Body& trigger;
     Body& other;
+    // `is_enter` is kept for backwards compatibility with the original
+    // trigger API.  A newly-overlapping pair has is_enter=true and an ended
+    // pair has is_exit=true.  Persistent overlaps are deliberately quiet:
+    // trigger callbacks are enter/exit notifications, not a per-frame stream.
+    // `is_stay` remains available for code that builds/forwards richer event
+    // records, but World does not emit stay notifications by default.
     bool is_enter{true};
+    bool is_stay{false};
+    bool is_exit{false};
+
+    bool entering() const { return is_enter; }
+    bool staying() const { return is_stay; }
+    bool exiting() const { return is_exit || (!is_enter && !is_stay); }
 };
 
 struct DestructionEvent {

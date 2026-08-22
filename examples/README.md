@@ -8,7 +8,8 @@ A GLFW-rendered physics demo built with Butter.
 
 - Crates fall from the air under gravity.
 - They collide, tumble, and settle into a stack through real physics.
-- Press `Space` to trigger an explosion.
+- The demo triggers a blast automatically after the initial three-second
+  settling period; press `Space` to trigger it earlier.
 - Crates that receive a strong enough explosion impulse fracture into smaller debris.
 - Fragments and surviving crates fly outward along different trajectories, then slow down and rest.
 

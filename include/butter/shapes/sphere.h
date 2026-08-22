@@ -17,7 +17,7 @@ public:
     }
 
     math::AABB compute_aabb(const math::Transform& transform) const override {
-        const math::Vec3 center = transform.position + offset.position;
+        const math::Vec3 center = transform.transform_point(offset.position);
         const math::Vec3 delta{radius_, radius_, radius_};
         return {center - delta, center + delta};
     }

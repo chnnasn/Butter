@@ -27,7 +27,7 @@ public:
     }
 
     math::AABB compute_aabb(const math::Transform& transform) const override {
-        const math::Vec3 center = transform.position + offset.position;
+        const math::Vec3 center = transform.transform_point(offset.position);
         const math::Mat3 rotation = (transform.rotation * offset.rotation).to_mat3();
         // Local capsule axis is Y.
         const math::Vec3 axis{rotation.m[0][1], rotation.m[1][1], rotation.m[2][1]};

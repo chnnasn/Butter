@@ -61,6 +61,10 @@ ctest --test-dir build
 | `test_collision` | 球-球、球-盒、盒-盒、分离检测 |
 | `test_world` | 重力、raycast、球落地稳定 |
 | `test_features` | 接触点冲量、碰撞过滤、阻尼 |
+| `test_pbd` | PBD 重力、接触投影、摩擦与堆叠 |
+| `test_triggers` | trigger enter/exit、方向、销毁清理 |
+| `test_shapes` | 胶囊、凸包、索引三角网格窄相位 |
+| `test_broadphase` | spatial-hash broadphase、AABB 查询、大代理 |
 
 运行全部测试：
 
@@ -73,9 +77,84 @@ ctest --test-dir build --output-on-failure
 
 - `butter/math` - 向量、矩阵、四元数、变换、包围盒
 - `butter/core` - 世界、刚体、Builder、材质、事件
-- `butter/shapes` - 球、盒、胶囊、凸包与碰撞检测
+- `butter/shapes` - 球、盒、胶囊、凸包、索引网格与碰撞检测
 - `butter/constraints` - 距离、弹簧、铰链关节
 - `butter/query` - 射线检测与重叠查询
+
+## Broadphase、PBD、Trigger 与碰撞形状
+
+World 默认启用动态 spatial-hash broadphase。它按刚体聚合 AABB 入格，
+再经过精确 AABB 和窄相位过滤；超大地面等代理会自动进入 large-proxy
+回退列表。可以按场景调整：
+
+```cpp
+World::Config config;
+config.enable_broadphase = true;
+config.broadphase_cell_size = 2.0f;
+config.broadphase_fat_margin = 0.05f;
+World world(config);
+
+auto& hull = world.create_body().dynamic()
+    .convex({{-1, 0, -1}, {1, 0, -1}, {0, 1, 0}, {0, 0, 1}})
+    .build();
+
+std::vector<Vec3> vertices{{-10, 0, -10}, {10, 0, -10},
+                           {10, 0, 10}, {-10, 0, 10}};
+std::vector<MeshCollider::Triangle> triangles{{0, 1, 2}, {0, 2, 3}};
+world.create_body().static_body().mesh(std::move(vertices), std::move(triangles)).build();
+```
+
+`ConvexCollider` 使用点集的凸包 support mapping（GJK/EPA），`MeshCollider`
+使用索引三角形窄相位，支持球、胶囊、盒、凸包和网格之间的检测。
+Trigger 只在状态转换时回调：`event.is_enter` 表示进入，`event.is_exit`
+表示离开；持续重叠不会每帧重复触发。
+
+`broadphase_candidate_count()` 会返回最近一次 broadphase 产生的刚体对
+数量；`broadphase_max_cells_per_body` 限制单个刚体最多占用的网格单元，
+避免超大地面代理淹没哈希表。
+
+可以显式配置 PBD 和 Trigger 生命周期：
+
+```cpp
+World::Config config;
+config.solver_mode = World::SolverMode::PBD;
+config.position_iterations = 8;
+World world(config);
+
+world.on_trigger = [](const TriggerEvent& event) {
+    if (event.is_enter) std::cout << "enter\n";
+    if (event.is_exit)  std::cout << "exit\n";
+};
+
+world.create_body().static_body().at(0, 1, 0)
+    .sphere(3.0f).trigger().build();
+```
+
+胶囊碰撞按“有限线段 + 半径”计算，包含胶囊-盒和胶囊-网格情况。凸包
+使用 GJK/EPA；网格窄相位使用索引三角形，并用最近点、SAT、GJK 处理球、
+胶囊、盒、凸包和网格之间的检测；无效或退化三角形会被忽略。碰撞体
+offset 和旋转 OBB AABB 都在刚体局部变换下计算。持续重叠在 enter 后保持
+安静，不会每帧重复回调。
+
+当前 spatial-hash 是刚体级 broadphase；网格窄相位会遍历其索引三角形，
+针对超大网格的内部 BVH 仍属于后续性能优化项。
+
+## 实际验证
+
+```bash
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+当前实现已通过全部 9 个测试程序。Windows 下查看 PBD 箱子堆和爆炸示例：
+
+```powershell
+cmake --build build --config Release --target exploding_crates
+.\build\examples\Release\exploding_crates.exe
+```
+
+示例会先让受重力影响的箱子堆稳定，再自动施加爆炸冲量；按 `Space` 重复
+爆炸，`R` 重置，`P` 暂停。
 
 ## 示例
 
@@ -110,18 +189,18 @@ Windows 下若 `E:/Github/glfw` 存在，CMake 会自动检测；否则显式传
 - 冲量求解、摩擦、位置修正
 - 接触点角速度计算，翻滚物体会被摩擦减速
 - 碰撞过滤、线性/角阻尼、睡眠
+- PBD 求解模式、动态 spatial-hash broadphase、trigger enter/exit 状态
+- 胶囊、凸包（GJK/EPA）和索引三角网格窄相位碰撞
 - 爆炸 + 动态破碎示例
 
 ### 近期
 
 - CCD 连续碰撞检测，彻底解决高速穿模
-- 更高效的 broadphase（BVH / 网格）
 - 堆叠稳定性和接触求解质量提升
 - 更多关节：滑轨、固定、马达
 
 ### 中期
 
-- 凸包与网格碰撞
 - 多线程求解
 - 简单软体、布料、弹簧骨骼
 - 车辆与角色控制器

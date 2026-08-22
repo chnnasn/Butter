@@ -1,4 +1,4 @@
-foreach(test_name test_math test_body test_collision test_world test_features)
+foreach(test_name test_math test_body test_collision test_world test_features test_pbd test_triggers test_shapes test_broadphase)
     add_executable(${test_name} ${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE butter)
     add_test(NAME ${test_name} COMMAND ${test_name})

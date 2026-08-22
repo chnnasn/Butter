@@ -9,6 +9,7 @@
 #include "butter/shapes/box.h"
 #include "butter/shapes/capsule.h"
 #include "butter/shapes/convex.h"
+#include "butter/shapes/mesh.h"
 #include "butter/shapes/sphere.h"
 
 namespace butter {
@@ -86,6 +87,13 @@ public:
 
     BodyBuilder& convex(std::vector<math::Vec3> points) {
         colliders_.push_back(std::make_unique<ConvexCollider>(std::move(points)));
+        return *this;
+    }
+
+    BodyBuilder& mesh(std::vector<math::Vec3> vertices,
+                      std::vector<MeshCollider::Triangle> triangles) {
+        colliders_.push_back(std::make_unique<MeshCollider>(
+            std::move(vertices), std::move(triangles)));
         return *this;
     }
 

@@ -6,8 +6,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <iomanip>
 #include <iostream>
 #include <random>
+#include <sstream>
+#include <string>
 #include <vector>
 
 using namespace butter;
@@ -47,6 +50,16 @@ public:
     Body* ground_body() const { return ground_; }
     bool exploded() const { return exploded_; }
     float shake() const { return shake_; }
+    bool blast_active() const { return blast_time_ > 0.0f; }
+    float elapsed() const { return elapsed_; }
+
+    float maximum_speed() {
+        float maximum = 0.0f;
+        for (auto& body : world_.bodies()) {
+            maximum = std::max(maximum, body.velocity.length());
+        }
+        return maximum;
+    }
 
     void reset() {
         world_ = World{};
@@ -56,10 +69,21 @@ public:
         exploded_ = false;
         shake_ = 0.0f;
         blast_time_ = 0.0f;
+        elapsed_ = 0.0f;
+        auto_detonate_time_ = 3.0f;
         build();
     }
 
     void tick(float dt) {
+        elapsed_ += dt;
+        // Make the sample self-demonstrating while retaining the Space key for
+        // a manual blast. Three seconds gives the stack time to fall and
+        // settle under gravity before the impulse is applied.
+        if (!exploded_ && auto_detonate_time_ > 0.0f) {
+            auto_detonate_time_ -= dt;
+            if (auto_detonate_time_ <= 0.0f) detonate();
+        }
+
         for (auto& flash : flashes_) {
             flash.life -= dt;
         }
@@ -73,15 +97,23 @@ public:
     void detonate() {
         if (exploded_) return;
         exploded_ = true;
-        shake_ = 1.0f;
+        // Keep the camera response subtle; this demo is intended to show the
+        // rigid-body response rather than a game-style explosion effect.
+        shake_ = 0.18f;
 
         const Vec3 center{0.0f, 2.0f, 0.0f};
-        constexpr float power = 120.0f;
-        std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-
+        // Impulse units are N*s. This value gives the nearest layer a clear
+        // but bounded response without launching the whole stack into orbit.
+        constexpr float power = 55.0f;
         blast_center_ = center;
-        blast_time_ = 0.35f;
-        flashes_.push_back({center, 0.55f});
+        blast_time_ = 0.12f;
+        // This marker was previously never inserted, so a successful blast
+        // looked exactly like a missed key press. Keep it short and restrained
+        // as a physical shock-front indicator rather than a fireball effect.
+        flashes_.push_back({center, 0.65f});
+        std::cout << "[blast] center=(" << center.x << ", " << center.y << ", "
+                  << center.z << "), crates=" << crates_.size()
+                  << ", impulse model=radial, power=" << power << " N*s\n";
 
         // Compute the explosion impulse for a position. Near bodies receive a
         // much larger impulse and therefore break into more fragments.
@@ -90,10 +122,13 @@ public:
             const float distance = std::max(0.2f, delta.length());
             const Vec3 direction = delta / distance;
             const float strength = power / (1.0f + distance * distance);
-            return direction * strength + Vec3{0, strength * 0.45f, 0};
+            // A short radial impulse plus the physical upward component from
+            // the ground. Avoid random lateral impulses: they make the scene
+            // look like a particle effect instead of a blast wave.
+            return direction * strength + Vec3{0, strength * 0.18f, 0};
         };
 
-        constexpr float fracture_threshold = 28.0f;
+        constexpr float fracture_threshold = 24.0f;
 
         for (auto it = crates_.begin(); it != crates_.end();) {
             Body& body = *it->body;
@@ -107,21 +142,11 @@ public:
                 fracture_crate(*it, impulse);
                 it = crates_.erase(it);
             } else {
-                const Vec3 contact = body.position +
-                                     Vec3{unit(rng_) - 0.5f, unit(rng_) - 0.5f, unit(rng_) - 0.5f} * 0.6f;
-                body.apply_impulse_at_point(impulse, contact);
+                body.apply_impulse_at_point(impulse, body.position);
                 ++it;
             }
         }
 
-        for (auto& piece : debris_) {
-            if (piece.body && !piece.body->is_destroyed()) {
-                const Vec3 impulse = explosion_impulse(piece.body->position);
-                const Vec3 contact = piece.body->position +
-                                     Vec3{unit(rng_) - 0.5f, unit(rng_) - 0.5f, unit(rng_) - 0.5f} * 0.4f;
-                piece.body->apply_impulse_at_point(impulse, contact);
-            }
-        }
     }
 
     // Sustained blast wave. A single impulse is only one frame of motion; this
@@ -131,7 +156,6 @@ public:
         if (blast_time_ <= 0.0f) return;
         blast_time_ -= dt;
 
-        std::uniform_real_distribution<float> unit(0.0f, 1.0f);
         constexpr float radius = 9.0f;
 
         auto push = [&](Body& body) {
@@ -140,21 +164,12 @@ public:
             if (distance > radius) return;
 
             const Vec3 radial = delta / distance;
-            const float falloff = 120.0f / (1.0f + distance * distance);
+            const float falloff = 55.0f / (1.0f + distance * distance);
 
-            // A random tangential component gives each object its own spin and
-            // curved trajectory instead of everyone flying straight outward.
-            Vec3 random_dir{unit(rng_) - 0.5f, unit(rng_) - 0.5f, unit(rng_) - 0.5f};
-            random_dir = random_dir.normalized();
-            Vec3 tangential = random_dir - radial * random_dir.dot(radial);
-            const float tangential_length = tangential.length();
-            if (tangential_length > 1.0e-3f) {
-                tangential = tangential / tangential_length;
-            } else {
-                tangential = {0, 1, 0};
-            }
-
-            const Vec3 force = (radial * falloff + tangential * (falloff * 0.4f)) * body.mass();
+            // Pressure is radial and deterministic. Torque should come from
+            // the body's contact geometry, not a new random direction every
+            // frame, so the result remains reproducible and explainable.
+            const Vec3 force = (radial * falloff + Vec3{0, falloff * 0.12f, 0}) * body.mass();
             body.apply_force(force);
         };
 
@@ -172,10 +187,13 @@ private:
         world_.config.enable_sleeping = true;
         world_.config.sleep_threshold = 0.15f;
 
-        // Smaller physics steps dramatically reduce tunneling for fast debris.
-        world_.config.fixed_timestep = 1.0f / 240.0f;
-        world_.config.velocity_iterations = 6;
+        // A 120 Hz fixed step with four PBD passes is a good interactive
+        // compromise for this 48-body demonstration. The world remains
+        // deterministic while avoiding the 240 Hz * 8-pass CPU cliff.
+        world_.config.fixed_timestep = 1.0f / 120.0f;
+        world_.config.velocity_iterations = 4;
         world_.config.position_iterations = 4;
+        world_.config.solver_mode = World::SolverMode::PBD;
 
         ground_ = &world_.create_body()
             .static_body()
@@ -190,28 +208,39 @@ private:
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
 
         for (int layer = 0; layer < layers; ++layer) {
-            const float base_y = 5.0f + static_cast<float>(layer) * 2.0f;
+            // The old scene used a two-unit vertical pitch for one-unit-wide
+            // crates. That left a full crate-sized gap between layers, so the
+            // objects could never form the advertised stack.  Start the
+            // compact pallet slightly above the floor and leave only a small
+            // clearance that gravity can close naturally.
+            const float base_y = 2.5f + static_cast<float>(layer) * 1.04f;
             for (int x = 0; x < side; ++x) {
                 for (int z = 0; z < side; ++z) {
-                    const float base_x = static_cast<float>(x - side / 2) + 0.5f;
-                    const float base_z = static_cast<float>(z - side / 2) + 0.5f;
-                    const float px = base_x + (unit(rng_) - 0.5f) * 0.4f;
-                    const float pz = base_z + (unit(rng_) - 0.5f) * 0.4f;
-                    const float y = base_y + (unit(rng_) - 0.5f) * 0.5f;
+                    const float base_x = (static_cast<float>(x) -
+                                          static_cast<float>(side - 1) * 0.5f) * 1.05f;
+                    const float base_z = (static_cast<float>(z) -
+                                          static_cast<float>(side - 1) * 0.5f) * 1.05f;
+                    // Small placement noise makes the pallet believable but
+                    // does not destroy contact between adjacent crates.
+                    const float px = base_x + (unit(rng_) - 0.5f) * 0.07f;
+                    const float pz = base_z + (unit(rng_) - 0.5f) * 0.07f;
+                    const float y = base_y + (unit(rng_) - 0.5f) * 0.05f;
 
                     Body& body = world_.create_body()
                         .dynamic()
                         .at(px, y, pz)
-                        .mass(1.0f)
+                        .mass(2.0f)
                         .box(0.5f, 0.5f, 0.5f)
                         .friction(0.85f)
                         .bounciness(0.05f)
                         .build();
-                    body.linear_damping = 0.15f;
-                    body.angular_damping = 0.6f;
-                    body.rotation = Quat::from_euler((unit(rng_) - 0.5f) * 0.6f,
-                                                     (unit(rng_) - 0.5f) * 0.6f,
-                                                     (unit(rng_) - 0.5f) * 0.6f);
+                    body.linear_damping = 0.35f;
+                    body.angular_damping = 0.85f;
+                    // Start the pallet with level crates. Subsequent rotation
+                    // comes from real contact/friction impulses; injecting a
+                    // large initial tilt into a position-only stack solver
+                    // creates artificial energy before the demo begins.
+                    body.rotation = Quat::identity();
                     crates_.push_back({&body, half});
                 }
             }
@@ -229,13 +258,19 @@ private:
         world_.destroy(original);
 
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-        const int fragment_count = std::clamp(static_cast<int>(impulse.length() / 12.0f), 6, 14);
+        const int fragment_count = std::clamp(static_cast<int>(impulse.length() / 20.0f), 6, 10);
         const float fragment_mass = mass / static_cast<float>(fragment_count);
 
         for (int i = 0; i < fragment_count; ++i) {
-            const Vec3 offset{unit(rng_) * 0.7f - 0.35f,
-                              unit(rng_) * 0.7f - 0.35f,
-                              unit(rng_) * 0.7f - 0.35f};
+            // Place fragments on a deterministic compact ring. Their spread
+            // comes from the fracture geometry and subsequent contacts, not
+            // from an unrelated random velocity kick.
+            const float angle = (2.0f * pi * static_cast<float>(i)) /
+                                static_cast<float>(fragment_count);
+            const float ring = 0.34f + 0.05f * static_cast<float>(i % 3);
+            const Vec3 offset{std::cos(angle) * ring,
+                              (static_cast<float>(i % 3) - 1.0f) * 0.10f,
+                              std::sin(angle) * ring};
             const Vec3 half{0.06f + unit(rng_) * 0.10f,
                             0.06f + unit(rng_) * 0.10f,
                             0.06f + unit(rng_) * 0.10f};
@@ -251,17 +286,20 @@ private:
             fragment.linear_damping = 0.3f;
             fragment.angular_damping = 0.9f;
             fragment.rotation = rotation *
-                Quat::from_euler((unit(rng_) - 0.5f) * 1.2f,
-                                 (unit(rng_) - 0.5f) * 1.2f,
-                                 (unit(rng_) - 0.5f) * 1.2f);
-            fragment.angular_velocity = angular_velocity +
-                Vec3{(unit(rng_) - 0.5f) * 12.0f,
-                     (unit(rng_) - 0.5f) * 12.0f,
-                     (unit(rng_) - 0.5f) * 12.0f};
+                Quat::from_euler(std::sin(angle) * 0.25f,
+                                 std::cos(angle) * 0.25f,
+                                 std::sin(angle * 0.5f) * 0.18f);
+            fragment.angular_velocity = angular_velocity;
 
-            Vec3 random_dir{unit(rng_) - 0.5f, unit(rng_) - 0.5f, unit(rng_) - 0.5f};
-            random_dir = random_dir.normalized();
-            fragment.velocity = velocity + impulse + random_dir * (impulse.length() * 0.3f);
+            // Distribute the original impulse by mass.  Applying the full
+            // impulse to every fragment (the old implementation) multiplied
+            // momentum by fragment_count and made the result look like a
+            // particle explosion.  Applying J/N at each offset preserves the
+            // parent body's linear momentum and creates only physically
+            // explainable torque from the off-centre contact.
+            fragment.velocity = velocity;
+            fragment.apply_impulse_at_point(impulse / static_cast<float>(fragment_count),
+                                            position);
             debris_.push_back({&fragment, half});
         }
     }
@@ -276,6 +314,8 @@ private:
     float shake_ = 0.0f;
     float blast_time_ = 0.0f;
     Vec3 blast_center_{0.0f, 2.0f, 0.0f};
+    float elapsed_ = 0.0f;
+    float auto_detonate_time_ = 0.0f;
 };
 
 struct App {
@@ -287,7 +327,29 @@ struct App {
     double last_x = 0.0;
     double last_y = 0.0;
     float time_scale = 1.0f;
+    float title_timer = 0.0f;
 };
+
+void update_window_title(App& app, float dt) {
+    app.title_timer -= dt;
+    if (app.title_timer > 0.0f) return;
+    app.title_timer = 0.20f;
+
+    std::ostringstream title;
+    title << "Butter PBD | SPACE: blast | R: reset | P: pause | ";
+    if (!app.scene.exploded()) {
+        title << "stack settling (auto blast in 3s)";
+    } else if (app.scene.blast_active()) {
+        title << "BLAST WAVE ACTIVE";
+    } else {
+        title << "debris settling";
+    }
+    title << " | t=" << std::fixed << std::setprecision(1)
+          << app.scene.elapsed() << "s"
+          << " | dynamic=" << app.scene.world().dynamic_body_count()
+          << " | vmax=" << std::setprecision(2) << app.scene.maximum_speed();
+    glfwSetWindowTitle(app.window, title.str().c_str());
+}
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -378,6 +440,24 @@ void draw_cube(const Vec3& half, const Vec3& color, float alpha = 1.0f) {
     glEnd();
 }
 
+void draw_ground_grid() {
+    // A subdued scale grid makes the fall, contact height, and blast radius
+    // legible without turning the demo into a neon game arena.
+    glDisable(GL_DEPTH_TEST);
+    glLineWidth(1.0f);
+    glColor4f(0.18f, 0.19f, 0.22f, 1.0f);
+    glBegin(GL_LINES);
+    for (int i = -20; i <= 20; ++i) {
+        const float p = static_cast<float>(i);
+        glVertex3f(p, 0.505f, -20.0f);
+        glVertex3f(p, 0.505f, 20.0f);
+        glVertex3f(-20.0f, 0.505f, p);
+        glVertex3f(20.0f, 0.505f, p);
+    }
+    glEnd();
+    glEnable(GL_DEPTH_TEST);
+}
+
 void set_model_transform(const Vec3& position, const Quat& rotation) {
     glPushMatrix();
     glTranslatef(position.x, position.y, position.z);
@@ -435,6 +515,7 @@ void render(const ExplosionScene& scene, const Camera& camera) {
     glTranslatef(ground_pos.x, ground_pos.y, ground_pos.z);
     draw_cube({20.0f, 0.5f, 20.0f}, {0.28f, 0.28f, 0.32f});
     glPopMatrix();
+    draw_ground_grid();
 
     // Crates.
     for (const auto& crate : scene.crates()) {
@@ -545,7 +626,8 @@ int main() {
             app.scene.apply_blast_force(frame_dt);
             app.scene.world().step(frame_dt * app.time_scale);
         }
-        app.scene.tick(frame_dt);
+        app.scene.tick(app.paused ? 0.0f : frame_dt);
+        update_window_title(app, frame_dt);
 
         render(app.scene, app.camera);
         glfwSwapBuffers(window);

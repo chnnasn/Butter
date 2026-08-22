@@ -19,6 +19,7 @@
 #include "butter/shapes/box.h"
 #include "butter/shapes/capsule.h"
 #include "butter/shapes/convex.h"
+#include "butter/shapes/mesh.h"
 #include "butter/shapes/collision_test.h"
 
 #include "butter/core/body.h"

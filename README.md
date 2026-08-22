@@ -61,6 +61,10 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_collision` | Sphere-sphere, sphere-box, box-box, separation |
 | `test_world` | Gravity, raycast, resting ball |
 | `test_features` | Impulse-at-point, collision filtering, damping |
+| `test_pbd` | PBD gravity, contact projection, friction and stacks |
+| `test_triggers` | Trigger enter/exit, direction and destruction cleanup |
+| `test_shapes` | Capsule, convex and indexed-triangle narrow phase |
+| `test_broadphase` | Spatial-hash broadphase, AABB query and large proxies |
 
 Run all tests:
 
@@ -73,9 +77,88 @@ ctest --test-dir build --output-on-failure
 
 - `butter/math` - Vectors, matrices, quaternions, transforms, AABB
 - `butter/core` - World, body, builder, material, events
-- `butter/shapes` - Sphere, box, capsule, convex, collision detection
+- `butter/shapes` - Sphere, box, capsule, convex, indexed mesh, collision detection
 - `butter/constraints` - Distance, spring, hinge joints
 - `butter/query` - Raycast and overlap queries
+
+## Broadphase, PBD, triggers and collision shapes
+
+World enables a dynamic spatial-hash broadphase by default. Aggregate body
+AABBs are inserted into cells, then exact AABB and narrow-phase tests remove
+false positives. Very large ground-like proxies automatically use a bounded
+large-proxy fallback. Tune it per scene:
+
+```cpp
+World::Config config;
+config.enable_broadphase = true;
+config.broadphase_cell_size = 2.0f;
+config.broadphase_fat_margin = 0.05f;
+World world(config);
+
+auto& hull = world.create_body().dynamic()
+    .convex({{-1, 0, -1}, {1, 0, -1}, {0, 1, 0}, {0, 0, 1}})
+    .build();
+
+std::vector<Vec3> vertices{{-10, 0, -10}, {10, 0, -10},
+                           {10, 0, 10}, {-10, 0, 10}};
+std::vector<MeshCollider::Triangle> triangles{{0, 1, 2}, {0, 2, 3}};
+world.create_body().static_body().mesh(std::move(vertices), std::move(triangles)).build();
+```
+
+`ConvexCollider` treats its point set as a convex hull through support mapping
+(GJK/EPA). `MeshCollider` uses indexed triangle narrow phase for sphere, capsule,
+box, convex and mesh pairs. Trigger callbacks are transition-based:
+`event.is_enter` is emitted on entry and `event.is_exit` on exit; persistent
+overlaps do not generate a callback every frame.
+
+`broadphase_candidate_count()` reports the number of body pairs emitted by
+the latest broadphase pass. `broadphase_max_cells_per_body` bounds how many
+grid cells one body may occupy, so a large floor cannot flood the hash table.
+
+PBD and trigger lifecycle can be configured explicitly:
+
+```cpp
+World::Config config;
+config.solver_mode = World::SolverMode::PBD;
+config.position_iterations = 8;
+World world(config);
+
+world.on_trigger = [](const TriggerEvent& event) {
+    if (event.is_enter) std::cout << "enter\n";
+    if (event.is_exit)  std::cout << "exit\n";
+};
+
+world.create_body().static_body().at(0, 1, 0)
+    .sphere(3.0f).trigger().build();
+```
+
+Capsule tests use a finite segment plus radius (including capsule-box and
+capsule-mesh cases). Convex data is solved with GJK/EPA. Mesh collision uses
+indexed triangles with closest-point, SAT and GJK tests; invalid or degenerate
+triangles are ignored. Collider offsets and rotated OBB AABBs are evaluated in
+body-local transforms. Persistent trigger overlaps remain quiet after enter.
+
+The spatial hash is currently a body-level broadphase. A mesh's narrow phase
+walks its indexed triangles; an internal mesh BVH is a planned optimization
+for very large meshes.
+
+## Verification
+
+```bash
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The current implementation passes all 9 test binaries. On Windows, inspect
+the PBD crate stack and explosion demo with:
+
+```powershell
+cmake --build build --config Release --target exploding_crates
+.\build\examples\Release\exploding_crates.exe
+```
+
+The demo settles a gravity-driven stack before an automatic blast. Press
+`Space` to repeat the blast, `R` to reset, and `P` to pause.
 
 ## Examples
 
@@ -111,18 +194,18 @@ dependency and is never vendored into Butter.
 - Impulse solver, friction, position correction
 - Contact angular velocity so spinning bodies are slowed by friction
 - Collision filtering, linear/angular damping, sleeping
+- PBD solver mode, dynamic spatial-hash broadphase, trigger enter/exit state
+- Capsule, convex (GJK/EPA) and indexed triangle mesh narrow-phase collision
 - Explosion + dynamic fracture demo
 
 ### Near-term
 
 - CCD to eliminate high-speed tunneling
-- Faster broadphase (BVH / grid)
 - Better stacking stability and contact quality
 - More joints: slider, fixed, motor
 
 ### Mid-term
 
-- Convex hull and mesh collision
 - Multithreaded solver
 - Basic soft body, cloth, spring bones
 - Vehicle and character controllers
