@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <variant>
+#include <utility>
 #include <vector>
 
 namespace butter::physics2d {
@@ -76,6 +77,11 @@ inline Vec2 center_of(const Shape& shape, const Transform& t) {
 inline AABB compute_aabb(const Shape& shape, const Transform& t) {
     if (const auto* circle = std::get_if<Circle>(&shape)) {
         const Vec2 r{circle->radius, circle->radius}; return {t.position - r, t.position + r};
+    }
+    if (const auto* box = std::get_if<Box>(&shape)) {
+        float c=std::abs(std::cos(t.angle)), s=std::abs(std::sin(t.angle));
+        Vec2 r{c*box->half_extents.x+s*box->half_extents.y,s*box->half_extents.x+c*box->half_extents.y};
+        return {t.position-r,t.position+r};
     }
     if (const auto* capsule = std::get_if<Capsule>(&shape)) {
         const Vec2 axis = rotate({0, capsule->half_length}, t.angle), r{capsule->radius, capsule->radius};
@@ -200,6 +206,77 @@ inline bool test(const Shape& a, const Transform& ta, const Shape& b, const Tran
     if (const auto* ma = std::get_if<Mesh>(&a)) { for (const auto& tri : ma->triangles) if (test(Shape{tri}, ta, b, tb, c)) return true; return false; }
     if (const auto* mb = std::get_if<Mesh>(&b)) { if (test(b, tb, a, ta, c)) { c.normal = -c.normal; return true; } return false; }
     return polygon_polygon(a, ta, b, tb, c);
+}
+
+// Clip the incident edge against the reference face. Feature IDs are edge/endpoint
+// IDs (including generated intersections), independent of world coordinates.
+struct ManifoldPoint { Vec2 point{}; float separation{}; unsigned feature{}; };
+struct Manifold { Vec2 normal{}; ManifoldPoint points[2]{}; int count{}; };
+inline Manifold contact_manifold(const Shape& a, const Transform& ta, const Shape& b,
+                                 const Transform& tb, Vec2 normal, Vec2 fallback,
+                                 float separation, float margin = 0.002f) {
+    Manifold m; m.normal = normal;
+    const auto va = world_vertices(a, ta), vb = world_vertices(b, tb);
+    if (va.size() < 3 || vb.size() < 3) {
+        m.points[0] = {fallback, separation, 0}; m.count = 1; return m;
+    }
+    auto face = [](const std::vector<Vec2> &v, Vec2 n) {
+        int best = 0;
+        float alignment = -2;
+        Vec2 center{};
+        for (auto p : v)
+            center += p;
+        center /= float(v.size());
+        for (int i = 0; i < int(v.size()); ++i) {
+            auto edge = v[(i + 1) % v.size()] - v[i];
+            Vec2 out = Vec2{edge.y, -edge.x}.normalized();
+            if (out.dot(v[i] - center) < 0)
+                out = -out;
+            if (out.dot(n) > alignment) {
+                alignment = out.dot(n);
+                best = i;
+            }
+        }
+        return std::make_pair(best, alignment);
+    };
+    auto af = face(va, normal), bf = face(vb, -normal);
+    bool flip = bf.second > af.second + 0.001f;
+    const auto &ref = flip ? vb : va;
+    const auto &inc = flip ? va : vb;
+    const int ri = flip ? bf.first : af.first;
+    Vec2 r0 = ref[ri], r1 = ref[(ri + 1) % ref.size()];
+    Vec2 tangent = (r1 - r0).normalized();
+    Vec2 n = {tangent.y, -tangent.x};
+    if (n.dot(flip ? -normal : normal) < 0)
+        n = -n;
+    int ii = face(inc, -n).first;
+    Vec2 p0 = inc[ii], p1 = inc[(ii + 1) % inc.size()];
+    float lo = 0, hi = 1;
+    const float length = (r1 - r0).length();
+    float start = (p0 - r0).dot(tangent), delta = (p1 - p0).dot(tangent);
+    if (std::abs(delta) < 1e-8f) {
+        if (start < 0 || start > length)
+            return m;
+    } else {
+        float u = -start / delta, v = (length - start) / delta;
+        lo = std::max(0.0f, std::min(u, v));
+        hi = std::min(1.0f, std::max(u, v));
+    }
+    if (lo > hi)
+        return m;
+    for (int k = 0; k < 2; ++k) {
+        float t = k ? hi : lo;
+        if (k && hi - lo < 1e-6f)
+            break;
+        Vec2 p = p0 + (p1 - p0) * t;
+        float d = (p - r0).dot(n);
+        if (d > margin)
+            continue;
+        unsigned endpoint = t < 1e-6f ? 0 : t > 1 - 1e-6f ? 1 : 2 + k;
+        m.points[m.count++] = {p - n * (d * 0.5f), d,
+                               unsigned((flip ? 1 : 0) << 24 | ri << 16 | ii << 8) | endpoint};
+    }
+    return m;
 }
 
 } // namespace butter::physics2d

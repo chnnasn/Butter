@@ -121,7 +121,8 @@ int main() try {
         body.sleeping = true;
         w.step();
         check(!body.sleeping && body.transform.position.x >= obstacle.transform.position.x + 0.059f,
-              "default CCD failed to wake a dynamic body hit by a moving kinematic wall");
+              "default CCD failed to wake a dynamic body hit by a moving kinematic "
+              "wall");
     }
     for (bool bullet : {false, true}) {
         World w(config());
@@ -279,7 +280,8 @@ int main() try {
               "iteration budget silently missed a rotational sweep");
     }
     {
-        // Deterministic dense temporal oracle catches missed rotational/translational contacts.
+        // Deterministic dense temporal oracle catches missed
+        // rotational/translational contacts.
         std::mt19937 rng(9127);
         std::uniform_real_distribution<float> position(-3, 3), angle(-3.14f, 3.14f);
         for (int i = 0; i < 150; ++i) {
@@ -315,6 +317,114 @@ int main() try {
         w.step();
         check(body.transform.position.x < 0 && w.ccd_statistics().sweeps < 5,
               "distant static obstacles were not rejected before narrow-phase CCD");
+    }
+    {
+        // A failing local ricochet must not discard an unrelated body's time.
+        auto c = config();
+        c.ccd.max_impacts = 1;
+        World w(c);
+        wall(w, -1, 1);
+        wall(w, 1, 1);
+        auto &ball = shot(w, 0, 600, 1);
+        auto &free = w.create_body().at(0, 20).circle(.1f).velocity(3, 0).build();
+        no_damping(free);
+        w.step(.01f);
+        check(std::abs(free.transform.position.x - .03f) < 1e-6f,
+              "local budget failure stopped unrelated motion");
+        check(std::abs(ball.transform.position.x) < .95f, "local clamp tunneled");
+        auto &stats = w.ccd_statistics();
+        check(stats.budget_exhaustions == 1 && stats.non_convergences == 0 &&
+                  !stats.diagnostics.empty(),
+              "missing budget diagnostic");
+        auto d = stats.diagnostics.front();
+        check(d.reason == CcdFailure::ImpactBudget && d.remaining_time > 0 &&
+                  std::abs(d.advanced_time + d.remaining_time - .01f) < 1e-6f,
+              "incorrect diagnostic times");
+        check(std::abs(stats.advanced_time - .01f) < 1e-6f,
+              "world time was discarded on local failure");
+    }
+    {
+        auto c = config();
+        c.ccd.max_iterations = 1;
+        World w(c);
+        auto &bar = w.create_body().box(2, .02f).angular_velocity(3.14159265f * 60).build();
+        no_damping(bar);
+        w.create_body().static_body().at(0, 1.5f).circle(.1f).build();
+        auto &free = w.create_body().at(20, 20).circle(.1f).velocity(3, 0).build();
+        no_damping(free);
+        w.step();
+        check(w.ccd_statistics().non_convergences > 0, "missing non-convergence diagnostic");
+        check(std::abs(free.transform.position.x - 20.05f) < 1e-5f,
+              "non-convergence blocked unrelated body");
+    }
+    {
+        // Joint projection is a second motion path, and needs its own sweep.
+        auto c = config();
+        World w(c);
+        w.create_body().static_body().at(0, -.005f).box(2, .005f).build();
+        auto &small = w.create_body().at(0, .08f).box(.02f, .02f).build();
+        auto &anchor = w.create_body().static_body().at(0, -1).circle(.01f).build();
+        w.add_distance_joint(small, anchor, 0);
+        w.step();
+        check(small.transform.position.y >= .019f, "joint position correction crossed thin floor");
+        check(w.step_statistics().position_clamps > 0, "projection CCD guard was not exercised");
+    }
+    {
+        World w(config());
+        w.create_body().static_body().at(0, -.005f).box(2, .005f).build();
+        auto &small = w.create_body().at(0, .05f).box(.02f, .02f).build();
+        auto &upper = w.create_body().at(0, .5f).box(.5f, .5f).mass(1000).build();
+        small.fixed_rotation = upper.fixed_rotation = true;
+        bool traced = false;
+        w.on_contact_diagnostic = [&](const World::ContactDiagnostic &d) {
+            if (!d.after_integration && d.a == &small) {
+                traced = true;
+                check(d.after_a.position.y >= .019f, "contact projection trace crossed floor");
+            }
+        };
+        w.step();
+        check(traced && small.transform.position.y >= .019f,
+              "contact position correction crossed floor outside original pairs");
+        check(small.angular_velocity == 0 && upper.angular_velocity == 0,
+              "fixed rotation changed during contact solving");
+    }
+    {
+        // Sleep-cache snapshots must notice direct public geometry edits, even
+        // when the new shapes' AABBs still overlap.
+        World w;
+        auto &ground = w.create_empty_body();
+        ground.type = BodyType::Static;
+        ground.inverse_mass = ground.inverse_inertia = 0;
+        ground.transform.position = {0, -.5f};
+        Fixture floor;
+        floor.shape = Box{{1, .5f}};
+        auto &f = w.add_fixture(ground, floor);
+        auto &body = w.create_empty_body();
+        body.transform.position = {.9f, .5f};
+        Fixture circle;
+        circle.shape = Circle{.5f};
+        w.add_fixture(body, circle);
+        int exits = 0;
+        w.on_contact = [&](Fixture &, Fixture &, bool enter) {
+            if (!enter)
+                ++exits;
+        };
+        for (int i = 0; i < 120; ++i)
+            w.step();
+        check(body.sleeping, "sleep-cache test did not settle");
+        f.shape = Circle{.6f};
+        w.step();
+        check(exits == 1, "sleep cache ignored direct shape mutation");
+        f.shape = Box{{1, .5f}};
+        w.step();
+        f.local.position.x = -.6f;
+        w.step();
+        check(exits == 2, "sleep cache ignored fixture offset mutation");
+        f.local.position.x = 0;
+        w.step();
+        ground.transform.position.x = -.6f;
+        w.step();
+        check(exits == 3, "sleep cache ignored public body transform mutation");
     }
     std::cout << checks << " CCD checks passed\n";
     return 0;

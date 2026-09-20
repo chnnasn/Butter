@@ -5,8 +5,11 @@
 #include "butter/physics2d/query.h"
 #include "butter/physics2d/shapes.h"
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -224,6 +227,22 @@ class BodyBuilder {
 
 class World {
   public:
+    struct StepStatistics {
+        double ccd_ms{}, detection_ms{}, velocity_ms{}, position_ms{};
+        std::size_t constraints{}, warm_started_points{}, position_clamps{};
+    };
+    struct ContactDiagnostic {
+        Body *a{}, *b{};
+        Vec2 velocity_a{}, velocity_b{}, normal{};
+        float penetration{};
+        Transform before_a{}, before_b{}, after_a{}, after_b{};
+        bool after_integration{}; // false denotes a position-solver correction.
+    };
+    // Optional first-error trace at post-integration detection and position updates.
+    std::function<void(const ContactDiagnostic &)> on_contact_diagnostic;
+    const StepStatistics &step_statistics() const { return step_statistics_; }
+    double simulation_time() const { return simulation_time_; }
+
     struct Config {
         Vec2 gravity{0, -9.81f};
         int solver_iterations{8};
@@ -292,6 +311,8 @@ class World {
     }
     void destroy_fixture(Fixture &fixture) {
         require_unlocked();
+        contact_cache_.clear();
+        constraints_.clear();
         forget_contacts(&fixture);
         auto &fixtures = fixture.body->fixtures;
         std::erase_if(fixtures, [&](const auto &p) { return p.get() == &fixture; });
@@ -302,6 +323,8 @@ class World {
     }
     void destroy_body(Body &body) {
         require_unlocked();
+        contact_cache_.clear();
+        constraints_.clear();
         for (auto &fixture : body.fixtures)
             forget_contacts(fixture.get());
         std::erase_if(joints_, [&](const auto &p) { return p->a == &body || p->b == &body; });
@@ -334,6 +357,7 @@ class World {
             Lock(bool &f) : flag(f) { flag = true; }
             ~Lock() { flag = false; }
         } lock(locked_);
+        step_statistics_ = {};
         for (auto &p : bodies_) {
             if (p->is_dynamic()) {
                 p->velocity += (config_.gravity + p->force * p->inverse_mass) * dt;
@@ -346,7 +370,15 @@ class World {
             p->force = {};
             p->torque = 0;
         }
+        // Resting contacts absorb gravity before CCD sees them as new impacts.
+        build_constraints(dt, true);
+        solve_velocities();
+        auto ccd_start = Clock::now();
         step_continuous(dt);
+        step_statistics_.ccd_ms += milliseconds(ccd_start);
+        build_constraints(dt, false);
+        solve_velocities();
+        auto event_start = Clock::now();
         const auto pairs = candidate_pairs();
         broadphase_candidate_count_ = pairs.size();
         std::unordered_set<std::uint64_t> current_triggers;
@@ -355,12 +387,16 @@ class World {
             Body &a = *bodies_[i];
             Body &b = *bodies_[j];
             visit_pairs(a, b, [&](Fixture &fa, Fixture &fb) {
+                if (a.use_default_shape && b.use_default_shape && !fa.trigger && !fb.trigger)
+                    return; // Legacy solid bodies have no fixture contact events.
                 Contact c;
                 if (!allowed(fa, fb))
                     return;
                 bool touching =
+                    (!fa.trigger && !fb.trigger && active_contacts_.contains({&fa, &fb}) &&
+                     sleeping_cache(fa, fb)) ||
                     test(fa.shape, fixture_transform(fa), fb.shape, fixture_transform(fb), c);
-                if (!touching && config_.ccd.enabled && active_contacts_.contains({&fa, &fb}) &&
+                if (!touching && config_.ccd.enabled && !fa.trigger && !fb.trigger &&
                     ccd_detail::supported(fa.shape) && ccd_detail::supported(fb.shape))
                     touching = ccd_detail::separation(fa.shape, fixture_transform(fa), fb.shape,
                                                       fixture_transform(fb))
@@ -393,31 +429,23 @@ class World {
                 emit_trigger(*bodies_[i], *bodies_[j], false);
             }
         active_triggers_ = std::move(current_triggers);
+        step_statistics_.detection_ms += milliseconds(event_start);
+        auto position_start = Clock::now();
         for (int iteration = 0; iteration < config_.solver_iterations; ++iteration) {
             for (auto &joint : joints_)
-                if (joint->spring_stiffness <= 0 || iteration == 0)
+                if (joint->spring_stiffness <= 0 || iteration == 0) {
+                    auto ta = joint->a->transform, tb = joint->b->transform;
                     joint->solve(dt);
-            for (auto [i, j] : pairs)
-                visit_pairs(*bodies_[i], *bodies_[j], [&](Fixture &fa, Fixture &fb) {
-                    if (!allowed(fa, fb) || fa.trigger || fb.trigger)
-                        return;
-                    Contact c;
-                    if (test(fa.shape, fixture_transform(fa), fb.shape, fixture_transform(fb), c))
-                        solve_contact(fa, fb, c);
-                });
+                    guard_projection(*joint->a, ta);
+                    guard_projection(*joint->b, tb);
+                }
+            for (auto &c : constraints_)
+                solve_position(c);
         }
-        for (auto &body : bodies_)
-            if (body->type == BodyType::Dynamic && !body->sleeping) {
-                if (body->velocity.length_squared() < 0.0025f &&
-                    std::abs(body->angular_velocity) < 0.05f) {
-                    if (++body->sleep_counter > 30) {
-                        body->sleeping = true;
-                        body->velocity = {};
-                        body->angular_velocity = 0;
-                    }
-                } else
-                    body->sleep_counter = 0;
-            }
+        step_statistics_.position_ms += milliseconds(position_start);
+        update_sleep();
+        save_constraints(dt);
+        simulation_time_ += dt;
     }
     void set_solver_iterations(int iterations) {
         config_.solver_iterations = std::max(1, iterations);
@@ -458,14 +486,18 @@ class World {
 
   private:
     CcdStatistics ccd_statistics_{};
+    std::vector<CcdMotion> ccd_motions_;
+    std::vector<Fixture> ccd_legacy_;
     void step_continuous(float dt) {
-        std::vector<CcdMotion> motions;
-        std::vector<Fixture> legacy;
-        motions.reserve(bodies_.size());
+        auto &motions = ccd_motions_;
+        auto &legacy = ccd_legacy_;
+        motions.resize(bodies_.size());
+        legacy.clear();
         legacy.reserve(bodies_.size());
-        for (auto &ptr : bodies_) {
-            Body &body = *ptr;
-            CcdMotion motion;
+        for (std::size_t index = 0; index < bodies_.size(); ++index) {
+            Body &body = *bodies_[index];
+            auto &motion = motions[index];
+            motion.colliders.clear();
             motion.transform = &body.transform;
             motion.velocity = &body.velocity;
             motion.angular_velocity = &body.angular_velocity;
@@ -488,7 +520,6 @@ class World {
             } else
                 for (auto &fixture : body.fixtures)
                     append(*fixture);
-            motions.push_back(std::move(motion));
         }
         ccd_statistics_ = advance_continuous(
             motions, dt, config_.ccd,
@@ -506,7 +537,8 @@ class World {
     }
     AABB broadphase_bounds(const Body &body) const {
         AABB bounds = body_aabb(body);
-        const float margin = config_.ccd.enabled ? std::max(config_.ccd.tolerance, 1.0e-6f) * 2 : 0;
+        const float margin =
+            std::max(0.002f, config_.ccd.enabled ? config_.ccd.tolerance * 2 : 0.0f);
         bounds.min -= Vec2{margin, margin};
         bounds.max += Vec2{margin, margin};
         return bounds;
@@ -586,60 +618,436 @@ class World {
         }
         return result;
     }
-    void solve_contact(Fixture &fa, Fixture &fb, const Contact &c) {
-        Body &a = *fa.body;
-        Body &b = *fb.body;
-        if (a.sleeping && ((b.is_dynamic() && b.velocity.length_squared() > 0.0025f) ||
-                           b.type == BodyType::Kinematic))
-            a.wake();
-        if (b.sleeping && ((a.is_dynamic() && a.velocity.length_squared() > 0.0025f) ||
-                           a.type == BodyType::Kinematic))
-            b.wake();
-        const float inv = a.inverse_mass + b.inverse_mass;
-        if (inv <= 0)
-            return;
-        const Vec2 ra = c.point - a.transform.position, rb = c.point - b.transform.position;
-        const Vec2 va = a.velocity + Vec2{-a.angular_velocity * ra.y, a.angular_velocity * ra.x};
-        const Vec2 vb = b.velocity + Vec2{-b.angular_velocity * rb.y, b.angular_velocity * rb.x};
-        const float rel = (vb - va).dot(c.normal);
-        const float projection = config_.solver_mode == SolverMode::PBD ? 1.0f : 0.8f;
-        const Vec2 correction =
-            c.normal * (std::clamp(c.penetration - 0.001f, 0.0f, config_.max_position_correction) /
-                        inv * projection);
-        if (a.is_dynamic())
-            a.transform.position -= correction * a.inverse_mass;
-        if (b.is_dynamic())
-            b.transform.position += correction * b.inverse_mass;
-        if (rel >= 0)
-            return;
-        const float e = -rel > std::min(fa.restitution_threshold, fb.restitution_threshold)
-                            ? std::max(fa.material.restitution, fb.material.restitution)
+    using Clock = std::chrono::steady_clock;
+    static double milliseconds(Clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    }
+    struct ConstraintPoint {
+        Vec2 local_a{}, local_b{};
+        float normal_impulse{}, tangent_impulse{}, target{};
+        unsigned feature{};
+    };
+    using ContactKey = std::array<std::uintptr_t, 4>;
+    struct Constraint {
+        ContactKey key{};
+        Body *a{}, *b{};
+        Vec2 normal{};
+        float friction{};
+        int count{};
+        ConstraintPoint points[2]{};
+        const Shape *shape_a{}, *shape_b{};
+        Transform fixture_a{}, fixture_b{};
+    };
+    struct CachedContact {
+        Constraint c;
+        float dt{};
+        std::size_t generation{};
+        Shape shape_a{}, shape_b{};
+        Transform transform_a{}, transform_b{};
+    };
+    std::size_t cache_generation_{};
+    std::map<ContactKey, CachedContact> contact_cache_;
+    std::vector<Constraint> constraints_;
+    std::vector<Body *> projection_obstacles_;
+    StepStatistics step_statistics_{};
+    double simulation_time_{};
+    static float inv_mass(const Body &b) { return b.is_dynamic() ? b.inverse_mass : 0; }
+    static float inv_inertia(const Body &b) {
+        return b.is_dynamic() && !b.fixed_rotation ? b.inverse_inertia : 0;
+    }
+    static Vec2 point_velocity(const Body &b, Vec2 r) {
+        if (b.type == BodyType::Static || b.sleeping)
+            return {};
+        return b.velocity + Vec2{-b.angular_velocity * r.y, b.angular_velocity * r.x};
+    }
+    static void apply(Constraint &c, Vec2 ra, Vec2 rb, Vec2 impulse) {
+        c.a->velocity -= impulse * inv_mass(*c.a);
+        c.b->velocity += impulse * inv_mass(*c.b);
+        c.a->angular_velocity -= ra.cross(impulse) * inv_inertia(*c.a);
+        c.b->angular_velocity += rb.cross(impulse) * inv_inertia(*c.b);
+    }
+    void save_constraints(float dt) {
+        ++cache_generation_;
+        for (auto &c : constraints_) {
+            auto &cached = contact_cache_[c.key];
+            cached.c = c;
+            cached.dt = dt;
+            cached.generation = cache_generation_;
+            cached.shape_a = *c.shape_a;
+            cached.shape_b = *c.shape_b;
+            cached.transform_a = c.a->transform;
+            cached.transform_b = c.b->transform;
+        }
+        std::erase_if(contact_cache_, [&](const auto &item) {
+            return item.second.generation != cache_generation_;
+        });
+    }
+    static ContactKey contact_key(const Fixture &a, const Fixture &b) {
+        return {reinterpret_cast<std::uintptr_t>(a.body), reinterpret_cast<std::uintptr_t>(b.body),
+                a.body->use_default_shape ? 0 : reinterpret_cast<std::uintptr_t>(&a),
+                b.body->use_default_shape ? 0 : reinterpret_cast<std::uintptr_t>(&b)};
+    }
+    static bool same_transform(const Transform &a, const Transform &b) {
+        return a.position == b.position && a.angle == b.angle;
+    }
+    static bool same_shape(const Shape &a, const Shape &b) {
+        if (a.index() != b.index())
+            return false;
+        if (auto p = std::get_if<Circle>(&a))
+            return p->radius == std::get<Circle>(b).radius;
+        if (auto p = std::get_if<Box>(&a))
+            return p->half_extents == std::get<Box>(b).half_extents;
+        if (auto p = std::get_if<Polygon>(&a))
+            return p->vertices == std::get<Polygon>(b).vertices;
+        if (auto p = std::get_if<Capsule>(&a)) {
+            auto q = std::get<Capsule>(b);
+            return p->radius == q.radius && p->half_length == q.half_length;
+        }
+        auto &x = std::get<Mesh>(a).triangles;
+        auto &y = std::get<Mesh>(b).triangles;
+        if (x.size() != y.size())
+            return false;
+        for (std::size_t i = 0; i < x.size(); ++i)
+            if (x[i].vertices != y[i].vertices)
+                return false;
+        return true;
+    }
+    const Constraint *sleeping_cache(const Fixture &a, const Fixture &b) const {
+        if (a.body->is_dynamic() || b.body->is_dynamic() || a.body->type == BodyType::Kinematic ||
+            b.body->type == BodyType::Kinematic)
+            return nullptr;
+        auto it = contact_cache_.find(contact_key(a, b));
+        if (it == contact_cache_.end())
+            return nullptr;
+        auto &old = it->second;
+        // Bodies and shapes are publicly writable: exact snapshots invalidate
+        // the sleep shortcut after teleports, geometry edits or fixture offsets.
+        if (!same_transform(a.body->transform, old.transform_a) ||
+            !same_transform(b.body->transform, old.transform_b) ||
+            !same_transform(a.local, old.c.fixture_a) ||
+            !same_transform(b.local, old.c.fixture_b) || !same_shape(a.shape, old.shape_a) ||
+            !same_shape(b.shape, old.shape_b))
+            return nullptr;
+        return &old.c;
+    }
+    void build_constraints(float dt, bool warm) {
+        auto start = Clock::now();
+        // During the second solve, impulses are already in velocities. Transfer
+        // accumulators but do not apply them again.
+        if (!warm)
+            save_constraints(dt);
+        constraints_.clear();
+        projection_obstacles_.clear();
+        for (auto &b : bodies_)
+            if (b->type != BodyType::Dynamic)
+                projection_obstacles_.push_back(b.get());
+        auto pairs = candidate_pairs();
+        for (auto [i, j] : pairs)
+            visit_pairs(*bodies_[i], *bodies_[j], [&](Fixture &fa, Fixture &fb) {
+                if (!allowed(fa, fb) || fa.trigger || fb.trigger)
+                    return;
+                if (auto cached = sleeping_cache(fa, fb)) {
+                    constraints_.push_back(*cached);
+                    return;
+                }
+                Contact contact;
+                auto ta = fixture_transform(fa), tb = fixture_transform(fb);
+                bool touching = test(fa.shape, ta, fb.shape, tb, contact);
+                if (!touching && ccd_detail::supported(fa.shape) &&
+                    ccd_detail::supported(fb.shape)) {
+                    auto sep = ccd_detail::separation(fa.shape, ta, fb.shape, tb);
+                    if (sep.distance > (config_.ccd.enabled ? 2 * config_.ccd.tolerance : 0.002f))
+                        return;
+                    contact = {sep.normal, sep.point, -sep.distance};
+                    touching = true;
+                }
+                if (!touching)
+                    return;
+                if (!warm && on_contact_diagnostic && contact.penetration > 0)
+                    on_contact_diagnostic({fa.body, fb.body, fa.body->velocity, fb.body->velocity,
+                                           contact.normal, contact.penetration, fa.body->transform,
+                                           fb.body->transform, fa.body->transform,
+                                           fb.body->transform, true});
+                Constraint c;
+                c.a = fa.body;
+                c.b = fb.body;
+                c.normal = contact.normal;
+                c.shape_a = fa.body->use_default_shape ? &fa.body->shape : &fa.shape;
+                c.shape_b = fb.body->use_default_shape ? &fb.body->shape : &fb.shape;
+                c.fixture_a = fa.local;
+                c.fixture_b = fb.local;
+                c.key = {reinterpret_cast<std::uintptr_t>(c.a),
+                         reinterpret_cast<std::uintptr_t>(c.b),
+                         c.a->use_default_shape ? 0 : reinterpret_cast<std::uintptr_t>(&fa),
+                         c.b->use_default_shape ? 0 : reinterpret_cast<std::uintptr_t>(&fb)};
+                c.friction = std::sqrt(std::max(0.0f, fa.material.friction * fb.material.friction));
+                auto m = contact_manifold(fa.shape, ta, fb.shape, tb, contact.normal, contact.point,
+                                          -contact.penetration);
+                c.count = m.count;
+                for (int k = 0; k < c.count; ++k) {
+                    auto &p = c.points[k];
+                    auto &mp = m.points[k];
+                    p.feature = mp.feature;
+                    Vec2 pa = mp.point - c.normal * (mp.separation * 0.5f),
+                         pb = mp.point + c.normal * (mp.separation * 0.5f);
+                    p.local_a = rotate(pa - c.a->transform.position, -c.a->transform.angle);
+                    p.local_b = rotate(pb - c.b->transform.position, -c.b->transform.angle);
+                    float speed = (point_velocity(*c.b, pb - c.b->transform.position) -
+                                   point_velocity(*c.a, pa - c.a->transform.position))
+                                      .dot(c.normal);
+                    p.target =
+                        -speed > std::max(1.0f, std::min(fa.restitution_threshold,
+                                                         fb.restitution_threshold))
+                            ? -std::max(fa.material.restitution, fb.material.restitution) * speed
                             : 0;
-        const float ca = ra.cross(c.normal), cb = rb.cross(c.normal);
-        const float denom = inv + ca * ca * a.inverse_inertia + cb * cb * b.inverse_inertia;
-        const float impulse = -(1 + e) * rel / denom;
-        const Vec2 j = c.normal * impulse;
-        if (a.is_dynamic()) {
-            a.velocity -= j * a.inverse_mass;
-            a.angular_velocity -= ra.cross(j) * a.inverse_inertia;
+                    auto old = contact_cache_.find(c.key);
+                    if (old != contact_cache_.end() && old->second.c.normal.dot(c.normal) > 0.95f) {
+                        for (int n = 0; n < old->second.c.count; ++n) {
+                            auto &prev = old->second.c.points[n];
+                            if (prev.feature == p.feature &&
+                                (prev.local_a - p.local_a).length_squared() < 0.04f &&
+                                (prev.local_b - p.local_b).length_squared() < 0.04f) {
+                                float ratio = old->second.dt > 0
+                                                  ? std::clamp(dt / old->second.dt, 0.0f, 2.0f)
+                                                  : 0;
+                                p.normal_impulse = prev.normal_impulse * ratio;
+                                p.tangent_impulse = prev.tangent_impulse * ratio;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (c.count)
+                    constraints_.push_back(c);
+            });
+        wake_connected();
+        if (warm)
+            for (auto &c : constraints_) {
+                if (!c.a->is_dynamic() && !c.b->is_dynamic())
+                    continue;
+                for (int k = 0; k < c.count; ++k) {
+                    auto &p = c.points[k];
+                    Vec2 ra = rotate(p.local_a, c.a->transform.angle),
+                         rb = rotate(p.local_b, c.b->transform.angle);
+                    if (p.normal_impulse > 0)
+                        ++step_statistics_.warm_started_points;
+                    apply(c, ra, rb,
+                          c.normal * p.normal_impulse +
+                              Vec2{-c.normal.y, c.normal.x} * p.tangent_impulse);
+                }
+            }
+        step_statistics_.constraints = constraints_.size();
+        step_statistics_.detection_ms += milliseconds(start);
+    }
+    void solve_velocities() {
+        auto start = Clock::now();
+        for (int iteration = 0; iteration < config_.solver_iterations; ++iteration)
+            for (auto &c : constraints_) {
+                float ma = inv_mass(*c.a), mb = inv_mass(*c.b), ia = inv_inertia(*c.a),
+                      ib = inv_inertia(*c.b);
+                if (ma + mb <= 0)
+                    continue;
+                if (c.count == 2) {
+                    Vec2 ra0 = rotate(c.points[0].local_a, c.a->transform.angle),
+                         rb0 = rotate(c.points[0].local_b, c.b->transform.angle);
+                    Vec2 ra1 = rotate(c.points[1].local_a, c.a->transform.angle),
+                         rb1 = rotate(c.points[1].local_b, c.b->transform.angle);
+                    float a0 = ra0.cross(c.normal), a1 = ra1.cross(c.normal),
+                          b0 = rb0.cross(c.normal), b1 = rb1.cross(c.normal);
+                    float k00 = ma + mb + ia * a0 * a0 + ib * b0 * b0,
+                          k11 = ma + mb + ia * a1 * a1 + ib * b1 * b1,
+                          k01 = ma + mb + ia * a0 * a1 + ib * b0 * b1;
+                    float det = k00 * k11 - k01 * k01;
+                    if (det > 1e-8f) {
+                        float v0 =
+                            c.points[0].target -
+                            (point_velocity(*c.b, rb0) - point_velocity(*c.a, ra0)).dot(c.normal);
+                        float v1 =
+                            c.points[1].target -
+                            (point_velocity(*c.b, rb1) - point_velocity(*c.a, ra1)).dot(c.normal);
+                        float d0 = (k11 * v0 - k01 * v1) / det, d1 = (k00 * v1 - k01 * v0) / det;
+                        if (c.points[0].normal_impulse + d0 >= 0 &&
+                            c.points[1].normal_impulse + d1 >= 0) {
+                            c.points[0].normal_impulse += d0;
+                            c.points[1].normal_impulse += d1;
+                            apply(c, ra0, rb0, c.normal * d0);
+                            apply(c, ra1, rb1, c.normal * d1);
+                        }
+                    }
+                }
+                for (int k = 0; k < c.count; ++k) {
+                    auto &p = c.points[k];
+                    Vec2 ra = rotate(p.local_a, c.a->transform.angle),
+                         rb = rotate(p.local_b, c.b->transform.angle);
+                    Vec2 rv = point_velocity(*c.b, rb) - point_velocity(*c.a, ra);
+                    float na = ra.cross(c.normal), nb = rb.cross(c.normal),
+                          denom = ma + mb + ia * na * na + ib * nb * nb;
+                    float previous = p.normal_impulse;
+                    p.normal_impulse =
+                        std::max(0.0f, previous + (p.target - rv.dot(c.normal)) / denom);
+                    apply(c, ra, rb, c.normal * (p.normal_impulse - previous));
+                    Vec2 tangent{-c.normal.y, c.normal.x};
+                    float sa = ra.cross(tangent), sb = rb.cross(tangent);
+                    rv = point_velocity(*c.b, rb) - point_velocity(*c.a, ra);
+                    previous = p.tangent_impulse;
+                    float limit = c.friction * p.normal_impulse;
+                    p.tangent_impulse = std::clamp(
+                        previous - rv.dot(tangent) / (ma + mb + ia * sa * sa + ib * sb * sb),
+                        -limit, limit);
+                    apply(c, ra, rb, tangent * (p.tangent_impulse - previous));
+                }
+            }
+        step_statistics_.velocity_ms += milliseconds(start);
+    }
+    void guard_projection(Body &body, Transform before) {
+        if (!config_.ccd.enabled || !body.is_dynamic())
+            return;
+        const auto after = body.transform;
+        if ((after.position - before.position).length_squared() < 1e-16f &&
+            std::abs(after.angle - before.angle) < 1e-8f)
+            return;
+        float fraction = 1;
+        for (auto *obstacle : projection_obstacles_) {
+            if (!body_aabb(body).overlaps(body_aabb(*obstacle))) {
+                auto bounds = body_aabb(body);
+                auto delta = before.position - after.position;
+                bounds.min.x += std::min(0.0f, delta.x);
+                bounds.min.y += std::min(0.0f, delta.y);
+                bounds.max.x += std::max(0.0f, delta.x);
+                bounds.max.y += std::max(0.0f, delta.y);
+                if (std::abs(after.angle - before.angle) < 1e-8f &&
+                    !bounds.overlaps(body_aabb(*obstacle)))
+                    continue;
+            }
+            visit_pairs(body, *obstacle, [&](Fixture &a, Fixture &b) {
+                if (a.trigger || b.trigger || !allowed(a, b))
+                    return;
+                if (ccd_detail::supported(a.shape) && ccd_detail::supported(b.shape)) {
+                    ShapeSweep projection{before, after, a.local};
+                    auto bt = fixture_transform(b);
+                    auto initial = ccd_detail::separation(a.shape, projection.at(0), b.shape, bt);
+                    // An already overlapping pair is outside sweep_shapes' contract.
+                    // Permit depenetration, but never deepen overlap during projection.
+                    if (initial.distance <= config_.ccd.tolerance) {
+                        float approach =
+                            (after.position - before.position).dot(initial.normal) +
+                            std::abs(after.angle - before.angle) *
+                                (ccd_detail::radius(a.shape) + a.local.position.length());
+                        if (approach > 1e-7f)
+                            fraction = 0;
+                        return;
+                    }
+                }
+                auto hit =
+                    sweep_shapes(a.shape, {before, after, a.local}, b.shape,
+                                 {obstacle->transform, obstacle->transform, b.local}, config_.ccd);
+                if (hit)
+                    fraction = std::min(fraction, hit->fraction);
+            });
         }
-        if (b.is_dynamic()) {
-            b.velocity += j * b.inverse_mass;
-            b.angular_velocity += rb.cross(j) * b.inverse_inertia;
+        if (fraction < 1) {
+            body.transform = {before.position + (after.position - before.position) * fraction,
+                              before.angle + (after.angle - before.angle) * fraction};
+            ++step_statistics_.position_clamps;
         }
-        const Vec2 tangent = (vb - va - c.normal * rel).normalized();
-        const float ta = ra.cross(tangent), tb = rb.cross(tangent);
-        const float jt = -(vb - va).dot(tangent) /
-                         (inv + ta * ta * a.inverse_inertia + tb * tb * b.inverse_inertia);
-        const float limit = impulse * std::sqrt(fa.material.friction * fb.material.friction);
-        const Vec2 friction = tangent * std::clamp(jt, -limit, limit);
-        if (a.is_dynamic()) {
-            a.velocity -= friction * a.inverse_mass;
-            a.angular_velocity -= ra.cross(friction) * a.inverse_inertia;
+    }
+    void solve_position(Constraint &c) {
+        float ma = inv_mass(*c.a), mb = inv_mass(*c.b), ia = inv_inertia(*c.a),
+              ib = inv_inertia(*c.b);
+        if (ma + mb <= 0)
+            return;
+        for (int k = 0; k < c.count; ++k) {
+            auto &p = c.points[k];
+            Vec2 ra = rotate(p.local_a, c.a->transform.angle),
+                 rb = rotate(p.local_b, c.b->transform.angle);
+            float separation =
+                (c.b->transform.position + rb - c.a->transform.position - ra).dot(c.normal);
+            float correction =
+                std::clamp(-separation - 0.001f, 0.0f, config_.max_position_correction);
+            if (correction == 0)
+                continue;
+            auto before_a = c.a->transform, before_b = c.b->transform;
+            float na = ra.cross(c.normal), nb = rb.cross(c.normal);
+            float impulse = correction * (config_.solver_mode == SolverMode::PBD ? 1.0f : 0.2f) /
+                            (ma + mb + ia * na * na + ib * nb * nb);
+            c.a->transform.position -= c.normal * (impulse * ma);
+            c.a->transform.angle -= na * impulse * ia;
+            c.b->transform.position += c.normal * (impulse * mb);
+            c.b->transform.angle += nb * impulse * ib;
+            guard_projection(*c.a, before_a);
+            guard_projection(*c.b, before_b);
+            if (on_contact_diagnostic)
+                on_contact_diagnostic({c.a, c.b, c.a->velocity, c.b->velocity, c.normal,
+                                       -separation, before_a, before_b, c.a->transform,
+                                       c.b->transform});
         }
-        if (b.is_dynamic()) {
-            b.velocity += friction * b.inverse_mass;
-            b.angular_velocity += rb.cross(friction) * b.inverse_inertia;
+    }
+    // Static floors do not merge unrelated islands. Contacts and joints connect
+    // dynamic bodies; an island sleeps only when every member is quiet.
+    std::vector<std::vector<Body *>> islands() {
+        std::map<Body *, std::size_t> index;
+        for (auto &b : bodies_)
+            if (b->type == BodyType::Dynamic)
+                index.emplace(b.get(), index.size());
+        std::vector<std::size_t> parent(index.size());
+        for (std::size_t i = 0; i < parent.size(); ++i)
+            parent[i] = i;
+        auto root = [&](std::size_t i) {
+            while (parent[i] != i) {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            return i;
+        };
+        auto join = [&](Body *a, Body *b) {
+            if (index.contains(a) && index.contains(b))
+                parent[root(index[a])] = root(index[b]);
+        };
+        for (auto &c : constraints_)
+            join(c.a, c.b);
+        for (auto &j : joints_)
+            join(j->a, j->b);
+        std::vector<std::vector<Body *>> groups(parent.size());
+        for (auto [b, i] : index)
+            groups[root(i)].push_back(b);
+        return groups;
+    }
+    void wake_connected() {
+        for (auto &c : constraints_) {
+            if (c.a->type == BodyType::Kinematic &&
+                (c.a->velocity.length_squared() > 0 || c.a->angular_velocity != 0) && c.b->sleeping)
+                c.b->wake();
+            if (c.b->type == BodyType::Kinematic &&
+                (c.b->velocity.length_squared() > 0 || c.b->angular_velocity != 0) && c.a->sleeping)
+                c.a->wake();
+        }
+        for (auto &group : islands()) {
+            bool awake = false;
+            for (auto *b : group)
+                awake |= !b->sleeping;
+            if (awake)
+                for (auto *b : group)
+                    if (b->sleeping)
+                        b->wake();
+        }
+    }
+    void update_sleep() {
+        for (auto &group : islands()) {
+            bool quiet = true;
+            int counter = 31;
+            for (auto *b : group) {
+                quiet &=
+                    b->velocity.length_squared() < 0.0025f && std::abs(b->angular_velocity) < 0.05f;
+                counter = std::min(counter, b->sleep_counter);
+            }
+            for (auto *b : group) {
+                b->sleep_counter = quiet ? counter + 1 : 0;
+                if (b->sleep_counter > 30) {
+                    b->sleeping = true;
+                    b->velocity = {};
+                    b->angular_velocity = 0;
+                }
+            }
         }
     }
     friend class BodyBuilder;
@@ -662,6 +1070,10 @@ class World {
             on_trigger(b, a, enter);
     }
     std::vector<std::pair<std::size_t, std::size_t>> candidate_pairs() const {
+        std::vector<AABB> bounds_cache;
+        bounds_cache.reserve(bodies_.size());
+        for (auto &b : bodies_)
+            bounds_cache.push_back(broadphase_bounds(*b));
         std::unordered_set<std::uint64_t> unique;
         if (!config_.enable_broadphase) {
             for (std::size_t i = 0; i < bodies_.size(); ++i)
@@ -677,7 +1089,7 @@ class World {
                 return (std::uint64_t(std::uint32_t(x)) << 32) | std::uint32_t(y);
             };
             for (std::size_t i = 0; i < bodies_.size(); ++i) {
-                const AABB bounds = broadphase_bounds(*bodies_[i]);
+                const AABB bounds = bounds_cache[i];
                 const int min_x = int(std::floor(bounds.min.x / cell)),
                           max_x = int(std::floor(bounds.max.x / cell));
                 const int min_y = int(std::floor(bounds.min.y / cell)),
@@ -715,7 +1127,7 @@ class World {
         result.reserve(unique.size());
         for (const auto key : unique) {
             const auto [i, j] = unpack_key(key);
-            if (broadphase_bounds(*bodies_[i]).overlaps(broadphase_bounds(*bodies_[j])))
+            if (bounds_cache[i].overlaps(bounds_cache[j]))
                 result.emplace_back(i, j);
         }
         std::sort(result.begin(), result.end());

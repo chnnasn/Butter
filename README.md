@@ -181,7 +181,7 @@ The 2D module includes circle, box, capsule, convex polygon and indexed
 triangle mesh narrow phase, spatial-hash broadphase, PBD/impulse projection,
 friction, angular motion, sleeping, collision filtering, enter/exit triggers,
 raycast/AABB queries, distance constraints and a `physics2d_playground`
-example. `bench_2d` measures a 100-body stack. A dedicated internal mesh BVH remains a future optimization. The 2D module now
+example. `bench_2d [count] [boxes]` checks landing correctness before reporting active and sleeping costs separately. A dedicated internal mesh BVH remains a future optimization. The 2D module now
 includes conservative swept CCD for circles, boxes and convex polygons.
 
 ### Engine integration with explicit fixtures
@@ -228,18 +228,33 @@ Fixture masks, the custom contact filter, and non-colliding connected joints are
 respected. Explicit fixtures emit contact transitions for CCD impacts, including
 an enter/exit pair for a bounce that separates within the same step.
 
-`config.ccd.max_impacts` (default 32), `max_iterations` (64), and `tolerance`
-(0.0001 world units) bound work and geometric precision. On budget exhaustion or
-nonconvergence, the remaining **world** motion is conservatively discarded rather
-than advanced without a sweep. `world.ccd_statistics()` exposes impacts, sweep
-count, the `limited` flag, and discarded `remaining_time`. This can slow a crowded
-or difficult rotating scene; tune budgets and monitor `limited` for your workload.
+`config.ccd.max_impacts` (default 32) bounds impacts **per moving body**;
+`max_iterations` (64) and `tolerance` (0.0001 world units) bound conservative
+advancement. Contacts at the same TOI are processed together. Budget exhaustion,
+nonconvergence, or repeated zero-time hits conservatively clamp only the involved
+motions for the rest of the step; unrelated bodies continue through CCD.
+`world.ccd_statistics()` separates these failure reasons and records body/collider
+indices plus elapsed/local remaining time. `remaining_time` now means the largest
+locally clamped interval, not discarded world time. Monitor these diagnostics:
+a local clamp is a conservative fallback, not equivalent-quality free motion.
+
+Persistent contacts use clipped two-point polygon manifolds, feature/anchor
+matching, accumulated normal/friction impulses, and warm starting. Velocity and
+position solving are separate. Contact/joint position corrections are checked
+against static and kinematic obstacles, including thin walls absent from the
+original contact candidates. Connected dynamic bodies wake and sleep together;
+a shared static floor does not join otherwise independent groups.
 
 Capsules and meshes still use discrete collision detection. Sensors retain
-endpoint overlap semantics and do not block CCD motion. Initial penetrations,
-authored teleports and position changes made by joint/penetration projection are
-handled by the existing discrete solver, not swept. Polygons must be convex and
-nondegenerate, and rotations are unwrapped (a full turn is `2*pi`, not zero).
+endpoint overlap semantics and do not block CCD motion. Authored teleports are
+not swept, and initial penetrations require discrete recovery. Polygons must be
+convex and nondegenerate, and rotations are unwrapped (a full turn is `2*pi`, not
+zero). Position guards cover the same convex shapes as CCD.
+
+See [2D correctness and validation](docs/physics2d-correctness.md) for first-error
+reproductions, diagnostic callbacks, stress-test commands, timing boundaries,
+and remaining limitations. Historical speed ratios are not a comparison target:
+verify physical time, penetration, sleep, and matching activity first.
 
 `test_2d_ccd` includes a tunneling negative control, thin-wall circle/box/polygon
 impacts, moving kinematics, bullet pairs, angular/offset sweeps, multiple rebounds,
