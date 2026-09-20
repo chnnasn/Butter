@@ -9,7 +9,7 @@ int main() {
     world.create_body().static_body().at(0, -1).box(10, 1).friction(0.8f).build();
     auto& ball = world.create_body().dynamic().at(0, 5).circle(0.5f).restitution(0).build();
     for (int i = 0; i < 240; ++i) world.step();
-    assert(ball.transform.position.y > -0.51f && ball.transform.position.y < 0.2f);
+    assert(ball.transform.position.y > 0.48f && ball.transform.position.y < 0.52f);
     assert(std::abs(ball.velocity.y) < 0.5f);
 
     Contact contact;

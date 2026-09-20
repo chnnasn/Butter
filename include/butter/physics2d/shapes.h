@@ -123,7 +123,16 @@ inline bool circle_polygon(const Circle& circle, const Transform& tc, const Shap
         if (d2 < best_dist2) { best_dist2 = d2; closest = point; }
     }
     const Vec2 delta = tc.position - closest; const float distance = std::sqrt(best_dist2);
-    if (distance >= circle.radius) return false;
+    bool positive=false, negative=false;
+    for (std::size_t i=0;i<vertices.size();++i) {
+        const float side=(vertices[(i+1)%vertices.size()]-vertices[i]).cross(tc.position-vertices[i]);
+        positive=positive || side>1.0e-6f; negative=negative || side<-1.0e-6f;
+    }
+    const bool inside=!(positive && negative);
+    if (!inside && distance >= circle.radius) return false;
+    if (inside && distance>1.0e-6f) {
+        c.normal=delta/distance; c.penetration=circle.radius+distance; c.point=closest; return true;
+    }
     c.normal = distance > 1.0e-6f ? -delta / distance : (tp.position - tc.position).normalized();
     if (c.normal.length_squared() < 1.0e-6f) c.normal = {0, 1};
     c.penetration = circle.radius - distance; c.point = closest; return true;
@@ -166,7 +175,12 @@ inline bool polygon_polygon(const Shape& sa, const Transform& ta, const Shape& s
     };
     if (!axes_from(va) || !axes_from(vb)) return false;
     c.normal = best_axis; c.penetration = best;
-    c.point = center_of(sa, ta) + best_axis * (best * 0.5f);
+    // Center of the overlapping support faces, rather than the center of A.
+    const Vec2 tangent{-best_axis.y,best_axis.x};
+    float alo,ahi,blo,bhi,atl,ath,btl,bth;
+    project(va,best_axis,alo,ahi);project(vb,best_axis,blo,bhi);
+    project(va,tangent,atl,ath);project(vb,tangent,btl,bth);
+    c.point=best_axis*((ahi+blo)*0.5f)+tangent*((std::max(atl,btl)+std::min(ath,bth))*0.5f);
     return true;
 }
 

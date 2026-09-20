@@ -184,6 +184,34 @@ raycast/AABB queries, distance constraints and a `physics2d_playground`
 example. `bench_2d` measures a 100-body stack. CCD and a dedicated internal
 mesh BVH remain future optimizations.
 
+### Engine integration with explicit fixtures
+
+`World::create_empty_body()` creates a dynamic body without the builder's default
+shape. Use `add_fixture(body, definition)` for stable, independently removable
+fixtures with local transforms, materials, trigger flags, and category/mask bits.
+Do not add explicit fixtures to a builder-created single-shape body.
+
+`contact_filter` adds an optional per-fixture filter. `on_contact(a, b, enter)`
+reports transitions between explicit fixtures, including solid contacts and
+triggers. Sleeping bodies retain contacts; fixture/body destruction emits exits
+before releasing fixtures. Callbacks run with `locked() == true`: queue world
+mutations until the callback or `step()` returns. Existing builder bodies retain
+the `on_trigger` API. Mixed builder/explicit pairs participate in collision solving,
+but do not publish transition callbacks.
+
+`destroy_fixture`, `destroy_joint`, and `destroy_body` release individual objects;
+body destruction also removes connected joints. `Body::user_data` and
+`Fixture::user_data` are explicit 64-bit values. Engines may use `force`, `torque`,
+`fixed_rotation`, and `BodyType::Kinematic`; engines that edit mass/type directly
+must keep inverse mass/inertia consistent. Fixture density is metadata: mass and
+inertia for explicit compound bodies are supplied by the engine integration.
+
+Distance joints support rotated local anchors and `collide_connected`; soft
+joints use `spring_stiffness` and `damping`. Deep penetration correction is bounded
+by `Config::max_position_correction`. Ray queries test circles and convex polygons
+(including rotated boxes) rather than their AABBs, and ignore origins inside them.
+CCD remains unsupported, so high-speed objects can tunnel through thin geometry.
+
 ## Examples
 
 ```bash
