@@ -125,7 +125,14 @@ inline bool circle_polygon(const Circle& circle, const Transform& tc, const Shap
         const Vec2 a = vertices[i], b = vertices[(i + 1) % vertices.size()];
         const Vec2 edge = b - a; const float denom = edge.length_squared();
         const float t = denom > 1.0e-12f ? std::clamp((tc.position - a).dot(edge) / denom, 0.0f, 1.0f) : 0.0f;
-        const Vec2 point = a + edge * t; const float d2 = (tc.position - point).length_squared();
+        // Project from the circle center on face interiors. Reconstructing from a
+        // distant endpoint loses tangential precision and injects spurious torque.
+        Vec2 point = a + edge * t;
+        if (t > 0 && t < 1) {
+            const Vec2 normal{-edge.y, edge.x};
+            point = tc.position - normal * ((tc.position - a).dot(normal) / denom);
+        }
+        const float d2 = (tc.position - point).length_squared();
         if (d2 < best_dist2) { best_dist2 = d2; closest = point; }
     }
     const Vec2 delta = tc.position - closest; const float distance = std::sqrt(best_dist2);

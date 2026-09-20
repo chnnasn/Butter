@@ -38,10 +38,12 @@ struct CcdDiagnostic {
     CcdFailure reason{};
     std::size_t body_a{}, body_b{}, collider_a{}, collider_b{};
     float advanced_time{}, remaining_time{};
+    float normal_speed{}, angular_a{}, angular_b{}, separation{};
 };
 struct CcdStatistics {
     int impacts{};
     std::size_t sweeps{};
+    std::size_t persistent_contacts{}; // Whole remaining trajectory certified on a contact plane.
     bool limited{};
     float remaining_time{}; // Largest locally clamped interval, not discarded
                             // world time.
@@ -85,18 +87,31 @@ struct Separation {
 inline Separation separation(const Shape &a, const Transform &ta, const Shape &b,
                              const Transform &tb) {
     Separation result;
+    const auto va = world_vertices(a, ta), vb = world_vertices(b, tb);
+    auto cached_support = [](const Shape &shape, const Transform &t,
+                             const std::vector<Vec2> &vertices, Vec2 n) {
+        if (auto *circle = std::get_if<Circle>(&shape))
+            return t.position + n * circle->radius;
+        float best = -std::numeric_limits<float>::infinity();
+        Vec2 point = t.position;
+        for (auto v : vertices)
+            if (v.dot(n) > best) {
+                best = v.dot(n);
+                point = v;
+            }
+        return point;
+    };
     auto axis_test = [&](Vec2 axis) {
         if (axis.length_squared() < 1.0e-16f)
             return;
         axis = axis.normalized();
         for (Vec2 n : {axis, -axis}) {
-            Vec2 pa = support(a, ta, n), pb = support(b, tb, -n);
+            Vec2 pa = cached_support(a, ta, va, n), pb = cached_support(b, tb, vb, -n);
             float gap = (pb - pa).dot(n);
             if (gap > result.distance)
                 result = {gap, n, (pa + pb) * 0.5f};
         }
     };
-    const auto va = world_vertices(a, ta), vb = world_vertices(b, tb);
     auto faces = [&](const std::vector<Vec2> &vertices) {
         for (std::size_t i = 0; i < vertices.size(); ++i) {
             Vec2 edge = vertices[(i + 1) % vertices.size()] - vertices[i];
@@ -117,23 +132,88 @@ inline Separation separation(const Shape &a, const Transform &ta, const Shape &b
     if (!std::isfinite(result.distance))
         axis_test({1, 0});
     const Vec2 tangent{-result.normal.y, result.normal.x};
-    auto feature = [&](const Shape &shape, const Transform &t, Vec2 n) {
-        Vec2 p = support(shape, t, n);
+    auto feature = [&](const Shape &shape, const Transform &t, const std::vector<Vec2> &vertices,
+                       Vec2 n) {
+        Vec2 p = cached_support(shape, t, vertices, n);
         float lo = std::numeric_limits<float>::infinity(), hi = -lo;
         if (std::holds_alternative<Circle>(shape))
             return std::make_pair(p.dot(tangent), p.dot(tangent));
-        for (auto v : world_vertices(shape, t))
+        for (auto v : vertices)
             if (p.dot(n) - v.dot(n) < 1.0e-5f) {
                 lo = std::min(lo, v.dot(tangent));
                 hi = std::max(hi, v.dot(tangent));
             }
         return std::make_pair(lo, hi);
     };
-    const auto [alo, ahi] = feature(a, ta, result.normal);
-    const auto [blo, bhi] = feature(b, tb, -result.normal);
+    const auto [alo, ahi] = feature(a, ta, va, result.normal);
+    const auto [blo, bhi] = feature(b, tb, vb, -result.normal);
     const float along = (std::max(alo, blo) + std::min(ahi, bhi)) * 0.5f;
     result.point = result.normal * result.point.dot(result.normal) + tangent * along;
     return result;
+}
+// Bounds every projected vertex over the entire angular interval, including
+// interior extrema. Endpoint-only checks would miss a rotating shape's return.
+inline std::pair<double, double> projected_motion(const Shape &shape, const ShapeSweep &sweep,
+                                                  Vec2 axis, Vec2 origin, Vec2 drift) {
+    double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+    const double start = sweep.start.angle, angle = double(sweep.end.angle) - start;
+    const double linear = double(drift.x) * axis.x + double(drift.y) * axis.y;
+    const double center = double(sweep.start.position.x - origin.x) * axis.x +
+                          double(sweep.start.position.y - origin.y) * axis.y;
+    auto vertex = [&](Vec2 q) {
+        double x = double(axis.x) * q.x + double(axis.y) * q.y;
+        double y = double(axis.y) * q.x - double(axis.x) * q.y;
+        auto sample = [&](double t) {
+            double theta = start + angle * t;
+            double value = center + linear * t + x * std::cos(theta) + y * std::sin(theta);
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+        };
+        sample(0);
+        sample(1);
+        constexpr double pi = 3.14159265358979323846;
+        if (std::abs(angle) > 2 * pi) {
+            // Constant-time conservative bound for arbitrarily many revolutions.
+            double r = std::hypot(x, y);
+            lo = std::min(lo, center + std::min(0.0, linear) - r);
+            hi = std::max(hi, center + std::max(0.0, linear) + r);
+            return;
+        }
+        double ca = angle * y, sa = -angle * x, r = std::hypot(ca, sa);
+        if (r == 0 || std::abs(linear) > r)
+            return;
+        double phase = std::atan2(sa, ca), root = std::acos(std::clamp(-linear / r, -1.0, 1.0));
+        double begin = std::min(start, start + angle), end = std::max(start, start + angle);
+        for (double base : {phase - root, phase + root}) {
+            double theta = base + std::ceil((begin - base) / (2 * pi)) * (2 * pi);
+            for (int i = 0; i < 2 && theta <= end; ++i, theta += 2 * pi) {
+                double t = (theta - start) / angle;
+                if (t >= 0 && t <= 1)
+                    sample(t);
+            }
+        }
+    };
+    if (auto *circle = std::get_if<Circle>(&shape)) {
+        vertex(sweep.local.position);
+        lo -= circle->radius;
+        hi += circle->radius;
+    } else {
+        for (auto q : world_vertices(shape, sweep.local))
+            vertex(q);
+    }
+    return {lo, hi};
+}
+inline bool separated_during_sweep(const Shape &a, const ShapeSweep &sa, const Shape &b,
+                                   const ShapeSweep &sb, Vec2 normal, float tolerance) {
+    // Remove common translation so a moving pair is not rejected merely because
+    // its endpoints share a large displacement in world space.
+    auto pa = projected_motion(a, sa, normal, sa.start.position, {});
+    Vec2 relative = (sb.end.position - sb.start.position) - (sa.end.position - sa.start.position);
+    auto pb = projected_motion(b, sb, normal, sa.start.position, relative);
+    const double roundoff = 8 * std::numeric_limits<float>::epsilon() *
+                            std::max({1.0, std::abs(pa.second), std::abs(pb.first)});
+    return std::isfinite(pa.second) && std::isfinite(pb.first) &&
+           pb.first - pa.second >= -double(tolerance) - roundoff;
 }
 inline AABB swept_bounds(const Shape &s, const ShapeSweep &sweep) {
     const float r = radius(s) + sweep.local.position.length();
@@ -228,10 +308,10 @@ struct CcdMotion {
 using CcdFilter = std::function<bool(const CcdCollider &, const CcdCollider &)>;
 using CcdImpact = std::function<void(const CcdCollider &, const CcdCollider &, const SweepHit &)>;
 
-inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt,
-                                        const CcdSettings &settings = {},
-                                        const CcdFilter &filter = {},
-                                        const CcdImpact &impact = {}) {
+inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, float dt,
+                                              const CcdSettings &settings = {},
+                                              const CcdFilter &filter = {},
+                                              const CcdImpact &impact = {}) {
     CcdStatistics stats;
     if (!std::isfinite(dt) || dt <= 0)
         return stats;
@@ -325,16 +405,72 @@ inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt
                         ++stats.sweeps;
                         auto hit = sweep_shapes(*fx.shape, x.sweep(remaining, fx), *fy.shape,
                                                 y.sweep(remaining, fy), settings);
+                        if (!hit && ccd_detail::supported(*fx.shape) &&
+                            ccd_detail::supported(*fy.shape)) {
+                            auto initial = ccd_detail::separation(*fx.shape, x.sweep(0, fx).at(0),
+                                                                  *fy.shape, y.sweep(0, fy).at(0));
+                            // A discrete resting overlap must not disable motion
+                            // protection under pressure from the rest of a stack.
+                            if (initial.distance < -settings.tolerance)
+                                hit = SweepHit{0, initial.normal, initial.point, true};
+                        }
                         if (!hit)
                             continue;
-                        if (hit->fraction == 0) {
-                            Vec2 ra = hit->point - x.transform->position,
-                                 rb = hit->point - y.transform->position;
-                            Vec2 rv = y.linear() + Vec2{-y.angular() * rb.y, y.angular() * rb.x} -
-                                      x.linear() - Vec2{-x.angular() * ra.y, x.angular() * ra.x};
-                            if (rv.dot(hit->normal) >= -1e-6f &&
-                                std::abs(x.angular()) + std::abs(y.angular()) < 1e-6f)
+                        auto start_separation = ccd_detail::separation(
+                            *fx.shape, x.sweep(0, fx).at(0), *fy.shape, y.sweep(0, fy).at(0));
+                        const float contact_depth =
+                            hit->fraction == 0
+                                ? std::max(settings.tolerance, -start_separation.distance)
+                                : settings.tolerance;
+                        {
+                            if (ccd_detail::separated_during_sweep(
+                                    *fx.shape, x.sweep(remaining, fx), *fy.shape,
+                                    y.sweep(remaining, fy), hit->normal, contact_depth)) {
+                                ++stats.persistent_contacts;
                                 continue;
+                            }
+                        }
+                        if (hit->fraction == 0 || !hit->converged) {
+                            // The current corner may be separating while another
+                            // corner returns later. Advance only a certified prefix
+                            // instead of repeatedly resolving the current t=0 point.
+                            auto sx = x.sweep(remaining, fx), sy = y.sweep(remaining, fy);
+                            auto prefix = [](ShapeSweep sweep, float t) {
+                                sweep.end = {sweep.start.position +
+                                                 (sweep.end.position - sweep.start.position) * t,
+                                             sweep.start.angle +
+                                                 (sweep.end.angle - sweep.start.angle) * t};
+                                return sweep;
+                            };
+                            const float initial_gap =
+                                ccd_detail::separation(*fx.shape, sx.at(0), *fy.shape, sy.at(0))
+                                    .distance;
+                            // Re-entry uses an inner tolerance, leaving room for
+                            // roundoff before the persistent-contact certificate.
+                            const float prefix_tolerance =
+                                std::min(contact_depth,
+                                         .5f * (contact_depth + std::max(0.0f, -initial_gap)));
+                            float lo = 0, hi = 1;
+                            for (int iteration = 0;
+                                 iteration < std::min(24, std::max(1, settings.max_iterations));
+                                 ++iteration) {
+                                float mid = (lo + hi) * .5f;
+                                if (ccd_detail::separated_during_sweep(
+                                        *fx.shape, prefix(sx, mid), *fy.shape, prefix(sy, mid),
+                                        hit->normal, prefix_tolerance))
+                                    lo = mid;
+                                else
+                                    hi = mid;
+                            }
+                            // Stay inside the proved interval without inventing an early
+                            // collision a macroscopic distance from the surface.
+                            float fraction = std::nextafter(lo, 0.0f);
+                            if (fraction > 1e-6f) {
+                                auto next = ccd_detail::separation(*fx.shape, sx.at(fraction),
+                                                                   *fy.shape, sy.at(fraction));
+                                if (next.distance <= 2 * settings.tolerance)
+                                    hit = SweepHit{fraction, next.normal, next.point, true};
+                            }
                         }
                         earliest = std::min(earliest, hit->fraction);
                         hits.push_back({i, j, fi, fj, *hit});
@@ -370,8 +506,16 @@ inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt
                 stats.budget_exhaustions += reason == CcdFailure::ImpactBudget;
                 stats.non_convergences += reason == CcdFailure::NonConvergence;
                 stats.zero_time_repeats += reason == CcdFailure::ZeroTimeRepeat;
-                stats.diagnostics.push_back(
-                    {reason, entry.i, entry.j, entry.fi, entry.fj, dt - remaining, remaining});
+                Vec2 ra = first->point - a->transform->position,
+                     rb = first->point - b->transform->position;
+                Vec2 rv = b->linear() + Vec2{-b->angular() * rb.y, b->angular() * rb.x} -
+                          a->linear() - Vec2{-a->angular() * ra.y, a->angular() * ra.x};
+                float gap = ccd_detail::separation(*fa->shape, a->sweep(0, *fa).at(0), *fb->shape,
+                                                   b->sweep(0, *fb).at(0))
+                                .distance;
+                stats.diagnostics.push_back({reason, entry.i, entry.j, entry.fi, entry.fj,
+                                             dt - remaining, remaining, rv.dot(first->normal),
+                                             a->angular(), b->angular(), gap});
                 stats.limited = true;
                 stats.remaining_time = std::max(stats.remaining_time, remaining);
                 // Freeze only participants for this interval. Other motion is still
@@ -476,5 +620,64 @@ inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt
     }
     stats.advanced_time = dt;
     return stats;
+}
+// Ordinary dynamics have no CCD interaction with each other. With a small
+// stationary environment their TOI timelines are independent, even when they
+// share a floor. Solve each exactly once instead of rescanning the entire world
+// after every unrelated impact. Bullets and moving/kinematic obstacles retain
+// the coupled scheduler until a general swept-island scheduler is available.
+inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt,
+                                        const CcdSettings &settings = {},
+                                        const CcdFilter &filter = {},
+                                        const CcdImpact &impact = {}) {
+    std::vector<std::size_t> statics;
+    std::size_t dynamics = 0;
+    bool coupled = false;
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        auto &b = bodies[i];
+        coupled |= b.bullet || b.kinematic;
+        if (b.dynamic)
+            ++dynamics;
+        else
+            statics.push_back(i);
+    }
+    if (coupled || dynamics < 2 || statics.size() > 16 || !settings.enabled || !std::isfinite(dt) ||
+        dt <= 0)
+        return advance_continuous_group(bodies, dt, settings, filter, impact);
+    CcdStatistics total;
+    std::vector<CcdMotion> group(statics.size() + 1);
+    std::vector<std::size_t> indices;
+    indices.reserve(group.size());
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        if (!bodies[i].dynamic)
+            continue;
+        bodies[i].blocked = false;
+        if (!bodies[i].moves())
+            continue;
+        indices = statics;
+        indices.insert(std::lower_bound(indices.begin(), indices.end(), i), i);
+        for (std::size_t j = 0; j < indices.size(); ++j)
+            group[j] = bodies[indices[j]];
+        auto result = advance_continuous_group(group, dt, settings, filter, impact);
+        for (std::size_t j = 0; j < indices.size(); ++j)
+            if (indices[j] == i)
+                bodies[i].blocked = group[j].blocked;
+        total.impacts += result.impacts;
+        total.sweeps += result.sweeps;
+        total.candidates += result.candidates;
+        total.persistent_contacts += result.persistent_contacts;
+        total.limited |= result.limited;
+        total.remaining_time = std::max(total.remaining_time, result.remaining_time);
+        total.budget_exhaustions += result.budget_exhaustions;
+        total.non_convergences += result.non_convergences;
+        total.zero_time_repeats += result.zero_time_repeats;
+        for (auto d : result.diagnostics) {
+            d.body_a = indices[d.body_a];
+            d.body_b = indices[d.body_b];
+            total.diagnostics.push_back(d);
+        }
+    }
+    total.advanced_time = dt;
+    return total;
 }
 } // namespace butter::physics2d

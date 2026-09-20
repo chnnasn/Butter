@@ -251,6 +251,9 @@ not swept, and initial penetrations require discrete recovery. Polygons must be
 convex and nondegenerate, and rotations are unwrapped (a full turn is `2*pi`, not
 zero). Position guards cover the same convex shapes as CCD.
 
+See [TomCat zero-time CCD follow-up](docs/ccd-zero-time-followup.md) for the original
+fixture-based stack reproduction and independent static-environment timelines.
+
 See [2D correctness and validation](docs/physics2d-correctness.md) for first-error
 reproductions, diagnostic callbacks, stress-test commands, timing boundaries,
 and remaining limitations. Historical speed ratios are not a comparison target:

@@ -929,11 +929,10 @@ class World {
                     // An already overlapping pair is outside sweep_shapes' contract.
                     // Permit depenetration, but never deepen overlap during projection.
                     if (initial.distance <= config_.ccd.tolerance) {
-                        float approach =
-                            (after.position - before.position).dot(initial.normal) +
-                            std::abs(after.angle - before.angle) *
-                                (ccd_detail::radius(a.shape) + a.local.position.length());
-                        if (approach > 1e-7f)
+                        ShapeSweep fixed{obstacle->transform, obstacle->transform, b.local};
+                        float depth = std::max(config_.ccd.tolerance, -initial.distance);
+                        if (!ccd_detail::separated_during_sweep(a.shape, projection, b.shape, fixed,
+                                                                initial.normal, depth))
                             fraction = 0;
                         return;
                     }

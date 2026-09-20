@@ -35,14 +35,21 @@ static void falling(int count, bool boxes, bool stack, int layers = 5, bool must
     }
     auto &clock = w.create_body().kinematic().at(-2200, 0).velocity(3, 0).build();
     int limits = 0;
-    std::size_t warm = 0;
+    std::size_t warm = 0, zero_repeats = 0, persistent = 0;
+    int first_sleep = -1, late_limits = 0;
     float min_bottom = 100;
     int frames = stack ? 600 : 360;
     for (int f = 0; f < frames; ++f) {
         w.step();
         limits += w.ccd_statistics().limited;
         warm += w.step_statistics().warm_started_points;
+        zero_repeats += w.ccd_statistics().zero_time_repeats;
+        persistent += w.ccd_statistics().persistent_contacts;
+        if (f >= frames - 60)
+            late_limits += w.ccd_statistics().limited;
+        bool all_sleeping = true;
         for (auto *b : bodies) {
+            all_sleeping &= b->sleeping;
             auto bounds = compute_aabb(b->shape, b->transform);
             min_bottom = std::min(min_bottom, bounds.min.y);
             if (bounds.min.y < -.025f || !std::isfinite(b->transform.position.y)) {
@@ -52,6 +59,8 @@ static void falling(int count, bool boxes, bool stack, int layers = 5, bool must
                 throw std::runtime_error("body penetrated floor");
             }
         }
+        if (all_sleeping && first_sleep < 0)
+            first_sleep = f;
     }
     int asleep = 0;
     float speed = 0;
@@ -61,12 +70,15 @@ static void falling(int count, bool boxes, bool stack, int layers = 5, bool must
     }
     std::cout << (boxes ? "boxes" : "circles") << " count=" << count << " stack=" << stack
               << " sleeping=" << asleep << " limits=" << limits << " bottom=" << min_bottom
-              << " speed=" << speed << " warm=" << warm << std::endl;
+              << " speed=" << speed << " warm=" << warm << " zero_repeats=" << zero_repeats
+              << " persistent=" << persistent << " first_sleep=" << first_sleep << std::endl;
     require(std::abs(w.simulation_time() - frames / 60.0) < 1e-4, "world clock lost time");
     require(std::abs((clock.transform.position.x + 2200) - frames * .05f) < .08f,
             "unrelated motion lost time");
-    if (must_sleep)
+    if (must_sleep) {
         require(asleep == count, "landings failed to sleep");
+        require(late_limits == 0, "resting stack still triggers CCD protection");
+    }
     if (!stack)
         require(limits == 0, "simple landings required CCD fallback");
 }

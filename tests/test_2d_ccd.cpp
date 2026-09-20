@@ -42,6 +42,16 @@ static Body &shot(World &w, float x = -5, float velocity = 600, float restitutio
 }
 int main() try {
     {
+        // Long ground faces must not introduce a tangential normal component.
+        for (int i = 0; i < 50; ++i) {
+            float x = float(i) * .65f - 16;
+            Contact c;
+            bool hit = test(Circle{.25f}, {{x, .2499f}, 0}, Box{{100, .5f}}, {{0, -.5f}, 0}, c);
+            check(hit && c.normal.x == 0 && c.normal.y == -1 && c.point.x == x,
+                  "circle-floor contact injected tangential error");
+        }
+    }
+    {
         auto discrete = config();
         discrete.ccd.enabled = false;
         World off(discrete);
@@ -425,6 +435,134 @@ int main() try {
         ground.transform.position.x = -.6f;
         w.step();
         check(exits == 3, "sleep cache ignored public body transform mutation");
+    }
+    for (float gap : {.00005f, -.00005004f}) {
+        World w(config());
+        w.create_body().static_body().at(0, -.05f).box(10, .05f).build();
+        constexpr float angle = .3f, spin = .1f;
+        auto &box = w.create_body()
+                        .box(.5f, .5f)
+                        .angle(angle)
+                        .at(0, .5f * (std::cos(angle) + std::sin(angle)) + gap)
+                        .velocity(1, spin * .5f * (std::cos(angle) - std::sin(angle)) + .001f)
+                        .angular_velocity(spin)
+                        .build();
+        no_damping(box);
+        w.step();
+        check(!w.ccd_statistics().limited && w.ccd_statistics().persistent_contacts > 0,
+              "separating rotating contact was repeatedly reported at time zero");
+        check(std::abs(box.transform.position.x - 1.0f / 60) < 1e-6f &&
+                  std::abs(box.transform.angle - angle - spin / 60) < 1e-6f,
+              "persistent rotating contact lost tangential or angular motion");
+    }
+    {
+        Shape floor = Box{{10, .05f}}, bar = Box{{2, .02f}};
+        ShapeSweep ground{{{0, -.05f}, 0}, {{0, -.05f}, 0}, {}};
+        ShapeSweep spin{{{0, .02005f}, 0}, {{0, .02005f}, 6.2831853f}, {}};
+        check(!ccd_detail::separated_during_sweep(floor, ground, bar, spin, {0, 1}, .0001f),
+              "endpoint separation hid rotational re-entry");
+        ShapeSweep offset{{{0, 1}, 0}, {{0, 1}, -6.2831853f}, {{1, 0}, 0}};
+        check(!ccd_detail::separated_during_sweep(floor, ground, Shape{Circle{.1f}}, offset, {0, 1},
+                                                  .0001f),
+              "offset circle rotation was incorrectly certified safe");
+        std::mt19937 rng(7919);
+        std::uniform_real_distribution<float> dist(-3, 3);
+        for (int i = 0; i < 80; ++i) {
+            Shape shape = i % 2 ? Shape{Box{{.7f, .2f}}} : Shape{Circle{.3f}};
+            ShapeSweep motion{{{dist(rng), dist(rng)}, dist(rng)},
+                              {{dist(rng), dist(rng)}, dist(rng) * 5},
+                              {{dist(rng), dist(rng)}, dist(rng)}};
+            Vec2 axis = rotate({1, 0}, dist(rng));
+            auto range = ccd_detail::projected_motion(shape, motion, axis, {},
+                                                      motion.end.position - motion.start.position);
+            bool bounded = true;
+            for (int sample = 0; sample <= 400; ++sample) {
+                auto t = motion.at(float(sample) / 400);
+                float lo = ccd_detail::support(shape, t, -axis).dot(axis),
+                      hi = ccd_detail::support(shape, t, axis).dot(axis);
+                bounded &= range.first <= lo + 2e-5 && range.second >= hi - 2e-5;
+            }
+            check(bounded, "projected angular interval excluded an interior extremum");
+        }
+    }
+    {
+        World w(config());
+        w.create_body().static_body().at(0, -.05f).box(10, .05f).build();
+        auto &bar = w.create_body()
+                        .box(1, .1f)
+                        .angle(.3f)
+                        .at(0, std::sin(.3f) + .1f * std::cos(.3f) + .00005f)
+                        .angular_velocity(-1)
+                        .build();
+        no_damping(bar);
+        w.step(1);
+        check(w.ccd_statistics().impacts > 0 && !w.ccd_statistics().limited,
+              "rotating contact did not advance to the next corner's impact");
+        check(compute_aabb(bar.shape, bar.transform).min.y >= -.00011f,
+              "certified contact prefix crossed the floor");
+    }
+    {
+        // A shallow discrete overlap cannot turn off protection for the next motion.
+        Shape floor = Box{{10, .005f}}, box = Box{{.1f, .1f}};
+        Transform transforms[2] = {{{0, -.005f}, 0}, {{0, .0998f}, 0}};
+        Vec2 velocities[2] = {{}, {0, -600}};
+        float angular[2]{};
+        std::vector<CcdMotion> bodies(2);
+        for (int k = 0; k < 2; ++k) {
+            auto &b = bodies[k];
+            b.transform = &transforms[k];
+            b.velocity = &velocities[k];
+            b.angular_velocity = &angular[k];
+            b.dynamic = k == 1;
+            b.inverse_mass = k == 1 ? 1.f : 0.f;
+            b.colliders.push_back({k == 0 ? &floor : &box});
+        }
+        auto stats = advance_continuous(bodies, 1.f / 60);
+        check(transforms[1].position.y >= .09979f && std::abs(velocities[1].y) < 1e-4f,
+              "existing overlap disabled motion protection under stack pressure");
+        check(!stats.limited, "ordinary existing contact required a local clamp");
+    }
+    {
+        struct State {
+            std::array<Transform, 41> transforms{};
+            std::array<Vec2, 41> velocities{};
+            std::array<float, 41> angular{};
+        } a, b, c;
+        Shape floor = Box{{100, .01f}}, circle = Circle{.05f};
+        auto views = [&](State &s) {
+            std::vector<CcdMotion> result(41);
+            for (int i = 0; i < 41; ++i) {
+                auto &m = result[i];
+                m.transform = &s.transforms[i];
+                m.velocity = &s.velocities[i];
+                m.angular_velocity = &s.angular[i];
+                m.dynamic = i != 1;
+                m.inverse_mass = m.dynamic ? 1.f : 0.f;
+                m.colliders.push_back({i == 1 ? &floor : &circle});
+                s.transforms[i].position =
+                    i == 1 ? Vec2{0, -.01f} : Vec2{float(i) - 20, 2 + float(i) * .02f};
+                s.velocities[i] = i == 1 ? Vec2{} : Vec2{0, -600};
+            }
+            return result;
+        };
+        auto independent = views(a), coupled = views(b), limited = views(c);
+        auto fast = advance_continuous(independent, .01f);
+        auto reference = advance_continuous_group(coupled, .01f);
+        check(fast.impacts == 40 && reference.impacts == 40 && !fast.limited,
+              "independent CCD lost a collision");
+        for (int i = 0; i < 41; ++i)
+            check((a.transforms[i].position - b.transforms[i].position).length() < .0001f &&
+                      (a.velocities[i] - b.velocities[i]).length() < .0001f,
+                  "independent CCD changed a body's trajectory");
+        check(fast.sweeps * 2 < reference.sweeps,
+              "unrelated impacts still rescan all moving bodies");
+        CcdSettings settings;
+        settings.max_impacts = 0;
+        auto stopped = advance_continuous(limited, .01f, settings);
+        check(stopped.diagnostics.size() == 40, "partitioned diagnostics lost participants");
+        for (auto &d : stopped.diagnostics)
+            check((d.body_a == 0 && d.body_b == 1) || (d.body_a == 1 && d.body_b >= 2),
+                  "partitioned diagnostic body indices were not remapped");
     }
     std::cout << checks << " CCD checks passed\n";
     return 0;
