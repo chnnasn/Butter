@@ -1,6 +1,7 @@
 #pragma once
 
 #include "butter/core/material.h"
+#include "butter/physics2d/ccd.h"
 #include "butter/physics2d/query.h"
 #include "butter/physics2d/shapes.h"
 #include <algorithm>
@@ -46,6 +47,7 @@ struct Body {
     Shape shape{Circle{}};
     bool trigger{false};
     std::uint32_t collision_group{1}, collision_mask{0xffffffffu};
+    bool bullet{false}; // Also sweep against other dynamic bodies.
     bool sleeping{false};
     int sleep_counter{0};
     std::uint64_t user_data{};
@@ -127,6 +129,10 @@ class World;
 class BodyBuilder {
   public:
     explicit BodyBuilder(World &world) : world_(world) {}
+    BodyBuilder &bullet(bool value = true) {
+        bullet_ = value;
+        return *this;
+    }
     BodyBuilder &dynamic() {
         type_ = BodyType::Dynamic;
         return *this;
@@ -212,6 +218,7 @@ class BodyBuilder {
     Shape shape_{Circle{}};
     Material material_{};
     bool trigger_{false};
+    bool bullet_{false};
     std::uint32_t group_{1}, mask_{0xffffffffu};
 };
 
@@ -226,6 +233,7 @@ class World {
         float broadphase_cell_size{2.0f};
         std::size_t broadphase_max_cells_per_body{256};
         float max_position_correction{0.2f};
+        CcdSettings ccd{};
     };
     World() : World(Config{}) {}
     explicit World(const Config &config) : config_(config) {}
@@ -333,14 +341,12 @@ class World {
                 p->velocity *= std::max(0.0f, 1.0f - p->linear_damping * dt);
                 p->angular_velocity *= std::max(0.0f, 1.0f - p->angular_damping * dt);
             }
-            if (p->is_dynamic() || p->type == BodyType::Kinematic) {
-                p->transform.position += p->velocity * dt;
-                if (!p->fixed_rotation)
-                    p->transform.angle += p->angular_velocity * dt;
-            }
+            if (p->fixed_rotation)
+                p->angular_velocity = 0;
             p->force = {};
             p->torque = 0;
         }
+        step_continuous(dt);
         const auto pairs = candidate_pairs();
         broadphase_candidate_count_ = pairs.size();
         std::unordered_set<std::uint64_t> current_triggers;
@@ -350,8 +356,16 @@ class World {
             Body &b = *bodies_[j];
             visit_pairs(a, b, [&](Fixture &fa, Fixture &fb) {
                 Contact c;
-                if (!allowed(fa, fb) ||
-                    !test(fa.shape, fixture_transform(fa), fb.shape, fixture_transform(fb), c))
+                if (!allowed(fa, fb))
+                    return;
+                bool touching =
+                    test(fa.shape, fixture_transform(fa), fb.shape, fixture_transform(fb), c);
+                if (!touching && config_.ccd.enabled && active_contacts_.contains({&fa, &fb}) &&
+                    ccd_detail::supported(fa.shape) && ccd_detail::supported(fb.shape))
+                    touching = ccd_detail::separation(fa.shape, fixture_transform(fa), fb.shape,
+                                                      fixture_transform(fb))
+                                   .distance <= 2 * config_.ccd.tolerance;
+                if (!touching)
                     return;
                 if (a.use_default_shape && b.use_default_shape) {
                     if (fa.trigger || fb.trigger)
@@ -410,6 +424,7 @@ class World {
     }
     std::function<bool(const Fixture &, const Fixture &)> contact_filter;
     std::function<void(Fixture &, Fixture &, bool)> on_contact;
+    const CcdStatistics &ccd_statistics() const { return ccd_statistics_; }
     std::size_t body_count() const { return bodies_.size(); }
     std::size_t broadphase_candidate_count() const { return broadphase_candidate_count_; }
     std::vector<Body *> query_aabb(const AABB &area) const {
@@ -442,6 +457,60 @@ class World {
     std::function<void(Body &, Body &, bool)> on_trigger;
 
   private:
+    CcdStatistics ccd_statistics_{};
+    void step_continuous(float dt) {
+        std::vector<CcdMotion> motions;
+        std::vector<Fixture> legacy;
+        motions.reserve(bodies_.size());
+        legacy.reserve(bodies_.size());
+        for (auto &ptr : bodies_) {
+            Body &body = *ptr;
+            CcdMotion motion;
+            motion.transform = &body.transform;
+            motion.velocity = &body.velocity;
+            motion.angular_velocity = &body.angular_velocity;
+            motion.sleeping = &body.sleeping;
+            motion.sleep_counter = &body.sleep_counter;
+            motion.inverse_mass = body.type == BodyType::Dynamic ? body.inverse_mass : 0;
+            motion.inverse_inertia =
+                body.type == BodyType::Dynamic && !body.fixed_rotation ? body.inverse_inertia : 0;
+            motion.dynamic = body.type == BodyType::Dynamic;
+            motion.kinematic = body.type == BodyType::Kinematic;
+            motion.bullet = body.bullet;
+            auto append = [&](Fixture &f) {
+                motion.colliders.push_back({&f.shape, f.local, f.material.friction,
+                                            f.material.restitution, f.restitution_threshold,
+                                            f.collision_group, f.collision_mask, f.trigger, &f});
+            };
+            if (body.use_default_shape) {
+                legacy.push_back(legacy_fixture(body));
+                append(legacy.back());
+            } else
+                for (auto &fixture : body.fixtures)
+                    append(*fixture);
+            motions.push_back(std::move(motion));
+        }
+        ccd_statistics_ = advance_continuous(
+            motions, dt, config_.ccd,
+            [&](const CcdCollider &a, const CcdCollider &b) {
+                return allowed(*static_cast<Fixture *>(a.tag), *static_cast<Fixture *>(b.tag));
+            },
+            [&](const CcdCollider &a, const CcdCollider &b, const SweepHit &) {
+                auto *fa = static_cast<Fixture *>(a.tag);
+                auto *fb = static_cast<Fixture *>(b.tag);
+                if (fa->body->use_default_shape || fb->body->use_default_shape)
+                    return;
+                if (active_contacts_.insert({fa, fb}).second && on_contact)
+                    on_contact(*fa, *fb, true);
+            });
+    }
+    AABB broadphase_bounds(const Body &body) const {
+        AABB bounds = body_aabb(body);
+        const float margin = config_.ccd.enabled ? std::max(config_.ccd.tolerance, 1.0e-6f) * 2 : 0;
+        bounds.min -= Vec2{margin, margin};
+        bounds.max += Vec2{margin, margin};
+        return bounds;
+    }
     struct CallbackLock {
         bool &flag;
         bool previous;
@@ -608,7 +677,7 @@ class World {
                 return (std::uint64_t(std::uint32_t(x)) << 32) | std::uint32_t(y);
             };
             for (std::size_t i = 0; i < bodies_.size(); ++i) {
-                const AABB bounds = body_aabb(*bodies_[i]);
+                const AABB bounds = broadphase_bounds(*bodies_[i]);
                 const int min_x = int(std::floor(bounds.min.x / cell)),
                           max_x = int(std::floor(bounds.max.x / cell));
                 const int min_y = int(std::floor(bounds.min.y / cell)),
@@ -646,7 +715,7 @@ class World {
         result.reserve(unique.size());
         for (const auto key : unique) {
             const auto [i, j] = unpack_key(key);
-            if (body_aabb(*bodies_[i]).overlaps(body_aabb(*bodies_[j])))
+            if (broadphase_bounds(*bodies_[i]).overlaps(broadphase_bounds(*bodies_[j])))
                 result.emplace_back(i, j);
         }
         std::sort(result.begin(), result.end());
@@ -670,6 +739,7 @@ inline Body &BodyBuilder::build() {
     body->shape = std::move(shape_);
     body->material = material_;
     body->trigger = trigger_;
+    body->bullet = bullet_;
     body->angular_velocity = angular_velocity_;
     body->collision_group = group_;
     body->collision_mask = mask_;
