@@ -50,4 +50,9 @@ build/examples/Debug/exploding_crates.exe
 - 接触点相对速度包含角速度，因此旋转的碎片会被摩擦减速。
 - 线性和角阻尼让碎片失去能量并最终稳定。
 
+## 2D 基准结果
+
+本箱堆示例使用 3D API。独立的 TomCat 2D 适配层基准，包括测试环境、`ea8ef90` 结果与正确性边界，
+见[主 README](../README.zh-CN.md#2d-基准测试报告2026-09-21)。这些耗时不代表本示例的性能。
+
 返回主 README：[../README.zh-CN.md](../README.zh-CN.md)。

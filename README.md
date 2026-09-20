@@ -33,7 +33,8 @@ int main() {
         .dynamic()
         .at(0, 10, 0)
         .sphere(0.5f)
-        .bounciness(0.7f);
+        .bounciness(0.7f)
+        .build();
 
     for (int i = 0; i < 120; ++i) {
         world.step(1.0f / 60.0f);
@@ -65,6 +66,13 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_triggers` | Trigger enter/exit, direction and destruction cleanup |
 | `test_shapes` | Capsule, convex and indexed-triangle narrow phase |
 | `test_broadphase` | Spatial-hash broadphase, AABB query and large proxies |
+| `test_2d` | 2D bodies, collisions, queries and constraints |
+| `test_2d_ccd` | Swept CCD, thin walls, angular motion, failure isolation and contact precision |
+| `test_2d_engine` | Explicit fixtures, engine integration and contact lifecycle |
+| `test_3d_namespace` | Explicit 3D namespace compatibility |
+| `test_2d_stability` | Large landings, long resting stacks and connected wake/sleep |
+| `test_2d_tomcat_stack` | Original TomCat box parameters, time advancement and floor checks |
+| `test_2d_tomcat_circles` | 1,000-circle TomCat regression (runs `test_2d_tomcat_stack 1000 circles`) |
 
 Run all tests:
 
@@ -151,7 +159,9 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The current implementation passes all 9 test binaries. On Windows, inspect
+At `ea8ef90`, all 16 Release CTest cases passed (15 binaries); the three targeted
+Debug CCD/TomCat regressions also passed. These are repository regressions,
+separate from the external benchmark below. On Windows, inspect
 the PBD crate stack and explosion demo with:
 
 ```powershell
@@ -264,6 +274,78 @@ impacts, moving kinematics, bullet pairs, angular/offset sweeps, multiple reboun
 filters, sleeping bodies, contact transitions, budget fallback, and a deterministic
 dense-time collision oracle. Its checks stay enabled in Release builds.
 
+## 2D benchmark report (2026-09-21)
+
+Test environment and integration: [TomCat Engine — `dev_butter`](https://github.com/chnnasn/TomCat_Engine/tree/dev_butter).
+This run tested **Butter `ea8ef90`** through that branch's physics adapter against
+**Box2D 2.4.1** from TomCat's `main` branch. **`dev_butter` still pins an older
+Butter revision**: these results use the latest headers in an isolated test
+directory, not an updated dependency in the engine branch.
+
+Hardware and build: Intel Core i7-14650HX, Windows x64, MSVC 19.50.35724,
+C++20 Release (`/O2 /DNDEBUG`), single-threaded workloads. Each scene uses a
+1/60-second timestep, 60 warmup steps and 300 measured steps, with CCD and sleeping
+enabled. Box2D uses `Step(8,3)`; the Butter adapter maps this to 8 iterations.
+Six runs alternate library order; the first is discarded and the median of the
+remaining five is reported. No concurrent tests or compilation ran during timing;
+CPU affinity and power plans were not controlled. Timings exclude creation,
+rendering, scripts and engine synchronization.
+
+### Step time for 1,000 dynamic bodies
+
+| Scene | Box2D | Butter | Butter / Box2D time |
+| --- | ---: | ---: | ---: |
+| Separated motion, no collisions | 0.206 ms | 1.108 ms | 5.38× |
+| Falling circles | 0.537 ms | 5.867 ms | 10.92× |
+| Box stacks | 2.967 ms | 51.237 ms | 17.27× |
+
+The main observed improvement is in box stacking. Circle landings and separated
+motion remain in roughly the same relative performance range.
+
+| Box count | Previous run: Butter / Box2D time | This run: Butter / Box2D time |
+| --- | ---: | ---: |
+| 100 | 974.42× | 35.80× |
+| 500 | 134.74× | 28.43× |
+| 1,000 | 81.37× | 17.27× |
+
+These cross-session ratios are observations, not controlled version speedup
+factors. The engines follow different trajectories and sleep schedules, so the
+results compare actual costs from the same initial scenes, not equal-quality
+solver throughput.
+
+### Correctness and stability checks
+
+Separate diagnostics covered falling circles and box stacks at 100, 500 and
+1,000 bodies (six scenes):
+
+| Check | Result |
+| --- | --- |
+| Simulation time during 300 measured steps | Full 5 seconds in all six scenes |
+| CCD-limited steps | 0 |
+| Impact-budget exhaustion | 0 |
+| CCD nonconvergence | 0 |
+| Repeated zero-time collisions | 0 |
+| Detected ground crossings within the platform | 0 |
+| Nonfinite positions | 0 |
+
+All circle scenes and the 100-box stack slept. The 500- and 1,000-box stacks
+remained awake at the end. The ground check tests body centers within
+`abs(x) < 99`; it is not a full geometry-level penetration proof. The previously
+reproduced world stall, ground crossing and zero-time repeat failures did not
+recur in these cases. This limited validation does not replace comprehensive
+physics correctness testing.
+
+At about **51 ms per step**, the 1,000-box scene still exceeds the **16.67 ms**
+budget for 60 Hz. Next priorities are contact solving, CCD candidate processing,
+sleep overhead and the causes of persistent wakefulness, with activity state
+reported alongside timing.
+
+The supplied source, raw data and reproduction instructions are in the local
+TomCat checkout at `.scratch/comparison-20260921-r2/README.md` (not published by
+the branch link above). See also the repository's
+[CCD follow-up](docs/ccd-zero-time-followup.md) for implementation diagnostics
+and regression coverage; its local timing run is separate from this report.
+
 ## Examples
 
 ```bash
@@ -301,16 +383,19 @@ dependency and is never vendored into Butter.
 - PBD solver mode, dynamic spatial-hash broadphase, trigger enter/exit state
 - Capsule, convex (GJK/EPA) and indexed triangle mesh narrow-phase collision
 - Explosion + dynamic fracture demo
+- 2D convex CCD, persistent contact manifolds, warm starting and connected sleeping
+- Original TomCat circle/box regressions and activity-aware timing diagnostics
 
 ### Near-term
 
 - Extend CCD to 3D, capsules and meshes
 - Better stacking stability and contact quality
+- Profile contact solving, CCD candidates and sleeping before parallelizing
 - More joints: slider, fixed, motor
 
 ### Mid-term
 
-- Multithreaded solver
+- Multithreaded solver after serial correctness and profiling
 - Basic soft body, cloth, spring bones
 - Vehicle and character controllers
 

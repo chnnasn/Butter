@@ -51,4 +51,11 @@ build/examples/Debug/exploding_crates.exe
 - Contact velocity includes angular velocity, so spinning fragments are slowed by friction.
 - Linear and angular damping let debris lose energy and settle.
 
+## 2D benchmark results
+
+This crate demo uses the 3D API. The separate TomCat 2D adapter benchmark,
+including environment, `ea8ef90` results and correctness limits, is documented
+in the [main README](../README.md#2d-benchmark-report-2026-09-21).
+Its timing numbers do not describe this demo.
+
 Back to the main README: [../README.md](../README.md).
