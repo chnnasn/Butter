@@ -44,6 +44,7 @@ struct CcdStatistics {
     int impacts{};
     std::size_t sweeps{};
     std::size_t persistent_contacts{}; // Whole remaining trajectory certified on a contact plane.
+    std::size_t bounds_tests{};
     bool limited{};
     float remaining_time{}; // Largest locally clamped interval, not discarded
                             // world time.
@@ -308,10 +309,32 @@ struct CcdMotion {
 using CcdFilter = std::function<bool(const CcdCollider &, const CcdCollider &)>;
 using CcdImpact = std::function<void(const CcdCollider &, const CcdCollider &, const SweepHit &)>;
 
+// Caller-owned scratch storage; never shared between worlds or nested advances.
+// Contents are reset per call, while vector capacity survives across steps.
+struct CcdWorkspace {
+    struct Hit {
+        std::size_t i, j, fi, fj;
+        SweepHit hit;
+    };
+    struct Bounds {
+        std::size_t i;
+        AABB box;
+    };
+    std::vector<int> counts;
+    std::map<std::array<std::size_t, 4>, int> zero_hits;
+    std::vector<Bounds> bounds;
+    std::vector<Hit> hits;
+    std::vector<std::size_t> statics, indices;
+    std::vector<CcdMotion> group;
+};
+
 inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, float dt,
                                               const CcdSettings &settings = {},
                                               const CcdFilter &filter = {},
-                                              const CcdImpact &impact = {}) {
+                                              const CcdImpact &impact = {},
+                                              CcdWorkspace *workspace = nullptr) {
+    CcdWorkspace local;
+    auto &scratch = workspace ? *workspace : local;
     CcdStatistics stats;
     if (!std::isfinite(dt) || dt <= 0)
         return stats;
@@ -329,19 +352,13 @@ inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, fl
         stats.advanced_time = dt;
         return stats;
     }
-    std::vector<int> counts(bodies.size());
-    std::map<std::array<std::size_t, 4>, int> zero_hits;
-    struct Hit {
-        std::size_t i, j, fi, fj;
-        SweepHit hit;
-    };
-    struct Bounds {
-        std::size_t i;
-        AABB box;
-    };
-    std::vector<Bounds> bounds;
+    auto &counts = scratch.counts;
+    counts.assign(bodies.size(), 0);
+    auto &zero_hits = scratch.zero_hits;
+    zero_hits.clear();
+    auto &bounds = scratch.bounds;
     bounds.reserve(bodies.size());
-    std::vector<Hit> hits;
+    auto &hits = scratch.hits;
     hits.reserve(bodies.size());
     float remaining = dt;
     while (remaining > 0) {
@@ -379,12 +396,27 @@ inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, fl
             if (initialized)
                 bounds.push_back({i, total});
         }
-        std::sort(bounds.begin(), bounds.end(), [](auto &a, auto &b) {
-            return a.box.min.x == b.box.min.x ? a.i < b.i : a.box.min.x < b.box.min.x;
+        // Select the axis with the greater center spread. A tall stack should
+        // not enumerate every pair merely because their X projections overlap.
+        Vec2 low{std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()};
+        Vec2 high{-low.x, -low.y};
+        for (auto &entry : bounds) {
+            Vec2 center = (entry.box.min + entry.box.max) * .5f;
+            low.x = std::min(low.x, center.x);
+            low.y = std::min(low.y, center.y);
+            high.x = std::max(high.x, center.x);
+            high.y = std::max(high.y, center.y);
+        }
+        bool vertical = high.y - low.y > high.x - low.x;
+        auto lower = [&](const AABB &b) { return vertical ? b.min.y : b.min.x; };
+        auto upper = [&](const AABB &b) { return vertical ? b.max.y : b.max.x; };
+        std::sort(bounds.begin(), bounds.end(), [&](auto &a, auto &b) {
+            return lower(a.box) == lower(b.box) ? a.i < b.i : lower(a.box) < lower(b.box);
         });
         for (std::size_t bi = 0; bi < bounds.size(); ++bi)
             for (std::size_t bj = bi + 1;
-                 bj < bounds.size() && bounds[bj].box.min.x <= bounds[bi].box.max.x; ++bj) {
+                 bj < bounds.size() && lower(bounds[bj].box) <= upper(bounds[bi].box); ++bj) {
+                ++stats.bounds_tests;
                 if (!bounds[bi].box.overlaps(bounds[bj].box))
                     continue;
                 auto i = std::min(bounds[bi].i, bounds[bj].i),
@@ -628,9 +660,12 @@ inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, fl
 // the coupled scheduler until a general swept-island scheduler is available.
 inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt,
                                         const CcdSettings &settings = {},
-                                        const CcdFilter &filter = {},
-                                        const CcdImpact &impact = {}) {
-    std::vector<std::size_t> statics;
+                                        const CcdFilter &filter = {}, const CcdImpact &impact = {},
+                                        CcdWorkspace *workspace = nullptr) {
+    CcdWorkspace local;
+    auto &scratch = workspace ? *workspace : local;
+    auto &statics = scratch.statics;
+    statics.clear();
     std::size_t dynamics = 0;
     bool coupled = false;
     for (std::size_t i = 0; i < bodies.size(); ++i) {
@@ -643,10 +678,11 @@ inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt
     }
     if (coupled || dynamics < 2 || statics.size() > 16 || !settings.enabled || !std::isfinite(dt) ||
         dt <= 0)
-        return advance_continuous_group(bodies, dt, settings, filter, impact);
+        return advance_continuous_group(bodies, dt, settings, filter, impact, &scratch);
     CcdStatistics total;
-    std::vector<CcdMotion> group(statics.size() + 1);
-    std::vector<std::size_t> indices;
+    auto &group = scratch.group;
+    group.resize(statics.size() + 1);
+    auto &indices = scratch.indices;
     indices.reserve(group.size());
     for (std::size_t i = 0; i < bodies.size(); ++i) {
         if (!bodies[i].dynamic)
@@ -658,13 +694,14 @@ inline CcdStatistics advance_continuous(std::vector<CcdMotion> &bodies, float dt
         indices.insert(std::lower_bound(indices.begin(), indices.end(), i), i);
         for (std::size_t j = 0; j < indices.size(); ++j)
             group[j] = bodies[indices[j]];
-        auto result = advance_continuous_group(group, dt, settings, filter, impact);
+        auto result = advance_continuous_group(group, dt, settings, filter, impact, &scratch);
         for (std::size_t j = 0; j < indices.size(); ++j)
             if (indices[j] == i)
                 bodies[i].blocked = group[j].blocked;
         total.impacts += result.impacts;
         total.sweeps += result.sweeps;
         total.candidates += result.candidates;
+        total.bounds_tests += result.bounds_tests;
         total.persistent_contacts += result.persistent_contacts;
         total.limited |= result.limited;
         total.remaining_time = std::max(total.remaining_time, result.remaining_time);

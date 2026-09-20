@@ -230,6 +230,11 @@ class World {
     struct StepStatistics {
         double ccd_ms{}, detection_ms{}, velocity_ms{}, position_ms{};
         std::size_t constraints{}, warm_started_points{}, position_clamps{};
+        double sleeping_ms{}, cache_ms{};
+        std::size_t position_corrections{}, projection_candidates{}, projection_sweeps{};
+        std::size_t cached_manifolds{}, sleeping_contacts{}, active_constraints{};
+        std::size_t awake_bodies{}, sleep_groups{}, moving_groups{}, settling_groups{};
+        float max_speed{}, max_angular_speed{}, max_penetration{}, max_correction{};
     };
     struct ContactDiagnostic {
         Body *a{}, *b{};
@@ -311,6 +316,7 @@ class World {
     }
     void destroy_fixture(Fixture &fixture) {
         require_unlocked();
+        wake_neighbors(*fixture.body);
         contact_cache_.clear();
         constraints_.clear();
         forget_contacts(&fixture);
@@ -319,10 +325,13 @@ class World {
     }
     void destroy_joint(DistanceJoint &joint) {
         require_unlocked();
+        wake_neighbors(*joint.a);
+        wake_neighbors(*joint.b);
         std::erase_if(joints_, [&](const auto &p) { return p.get() == &joint; });
     }
     void destroy_body(Body &body) {
         require_unlocked();
+        wake_neighbors(body);
         contact_cache_.clear();
         constraints_.clear();
         for (auto &fixture : body.fixtures)
@@ -358,7 +367,14 @@ class World {
             ~Lock() { flag = false; }
         } lock(locked_);
         step_statistics_ = {};
+        auto cache_start = Clock::now();
+        invalidate_edited_contacts();
+        step_statistics_.cache_ms += milliseconds(cache_start);
         for (auto &p : bodies_) {
+            if (p->sleeping && p->type == BodyType::Dynamic &&
+                (p->force.length_squared() > 0 || p->torque != 0 ||
+                 p->velocity.length_squared() > 0 || p->angular_velocity != 0))
+                p->wake();
             if (p->is_dynamic()) {
                 p->velocity += (config_.gravity + p->force * p->inverse_mass) * dt;
                 p->angular_velocity += p->torque * p->inverse_inertia * dt;
@@ -379,10 +395,10 @@ class World {
         build_constraints(dt, false);
         solve_velocities();
         auto event_start = Clock::now();
-        const auto pairs = candidate_pairs();
+        const auto &pairs = candidate_pairs(false);
         broadphase_candidate_count_ = pairs.size();
-        std::unordered_set<std::uint64_t> current_triggers;
-        std::set<std::pair<Fixture *, Fixture *>> current_contacts;
+        current_triggers_.clear();
+        current_contacts_.clear();
         for (const auto [i, j] : pairs) {
             Body &a = *bodies_[i];
             Body &b = *bodies_[j];
@@ -392,43 +408,58 @@ class World {
                 Contact c;
                 if (!allowed(fa, fb))
                     return;
+                // Velocity solving has not changed geometry since detection.
+                // Solid event membership uses that same result; triggers still
+                // need their own overlap test because they create no constraints.
                 bool touching =
-                    (!fa.trigger && !fb.trigger && active_contacts_.contains({&fa, &fb}) &&
-                     sleeping_cache(fa, fb)) ||
-                    test(fa.shape, fixture_transform(fa), fb.shape, fixture_transform(fb), c);
-                if (!touching && config_.ccd.enabled && !fa.trigger && !fb.trigger &&
-                    ccd_detail::supported(fa.shape) && ccd_detail::supported(fb.shape))
-                    touching = ccd_detail::separation(fa.shape, fixture_transform(fa), fb.shape,
-                                                      fixture_transform(fb))
-                                   .distance <= 2 * config_.ccd.tolerance;
+                    !fa.trigger && !fb.trigger
+                        ? std::binary_search(solid_contacts_.begin(), solid_contacts_.end(),
+                                             contact_key(fa, fb))
+                        : test(fa.shape, fixture_transform(fa), fb.shape, fixture_transform(fb), c);
                 if (!touching)
                     return;
+                if (!contact_cache_.contains(contact_key(fa, fb))) {
+                    if (fa.body->type == BodyType::Dynamic && fa.body->sleeping)
+                        fa.body->wake();
+                    if (fb.body->type == BodyType::Dynamic && fb.body->sleeping)
+                        fb.body->wake();
+                }
                 if (a.use_default_shape && b.use_default_shape) {
                     if (fa.trigger || fb.trigger)
-                        current_triggers.insert(pair_key(i, j));
+                        current_triggers_.push_back(pair_key(i, j));
                 } else if (!a.use_default_shape && !b.use_default_shape) {
                     auto key = std::make_pair(&fa, &fb);
-                    current_contacts.insert(key);
-                    if (!active_contacts_.contains(key) && on_contact)
+                    current_contacts_.push_back(key);
+                    if (active_contacts_.insert(key).second && on_contact)
                         on_contact(fa, fb, true);
                 }
             });
         }
-        for (auto key : active_contacts_)
-            if (!current_contacts.contains(key) && on_contact)
-                on_contact(*key.first, *key.second, false);
-        active_contacts_ = std::move(current_contacts);
-        for (auto key : current_triggers)
-            if (!active_triggers_.contains(key) && on_trigger) {
+        std::sort(current_contacts_.begin(), current_contacts_.end());
+        for (auto it = active_contacts_.begin(); it != active_contacts_.end();) {
+            if (!std::binary_search(current_contacts_.begin(), current_contacts_.end(), *it)) {
+                auto key = *it;
+                it = active_contacts_.erase(it);
+                if (on_contact)
+                    on_contact(*key.first, *key.second, false);
+            } else
+                ++it;
+        }
+        std::sort(current_triggers_.begin(), current_triggers_.end());
+        for (auto key : current_triggers_)
+            if (active_triggers_.insert(key).second && on_trigger) {
                 auto [i, j] = unpack_key(key);
                 emit_trigger(*bodies_[i], *bodies_[j], true);
             }
-        for (auto key : active_triggers_)
-            if (!current_triggers.contains(key) && on_trigger) {
-                auto [i, j] = unpack_key(key);
-                emit_trigger(*bodies_[i], *bodies_[j], false);
-            }
-        active_triggers_ = std::move(current_triggers);
+        for (auto it = active_triggers_.begin(); it != active_triggers_.end();) {
+            if (!std::binary_search(current_triggers_.begin(), current_triggers_.end(), *it)) {
+                auto [i, j] = unpack_key(*it);
+                it = active_triggers_.erase(it);
+                if (on_trigger)
+                    emit_trigger(*bodies_[i], *bodies_[j], false);
+            } else
+                ++it;
+        }
         step_statistics_.detection_ms += milliseconds(event_start);
         auto position_start = Clock::now();
         for (int iteration = 0; iteration < config_.solver_iterations; ++iteration) {
@@ -439,11 +470,13 @@ class World {
                     guard_projection(*joint->a, ta);
                     guard_projection(*joint->b, tb);
                 }
-            for (auto &c : constraints_)
-                solve_position(c);
+            for (auto i : active_constraints_)
+                solve_position(constraints_[i]);
         }
         step_statistics_.position_ms += milliseconds(position_start);
+        auto sleep_start = Clock::now();
         update_sleep();
+        step_statistics_.sleeping_ms += milliseconds(sleep_start);
         save_constraints(dt);
         simulation_time_ += dt;
     }
@@ -486,6 +519,7 @@ class World {
 
   private:
     CcdStatistics ccd_statistics_{};
+    CcdWorkspace ccd_workspace_;
     std::vector<CcdMotion> ccd_motions_;
     std::vector<Fixture> ccd_legacy_;
     void step_continuous(float dt) {
@@ -533,7 +567,8 @@ class World {
                     return;
                 if (active_contacts_.insert({fa, fb}).second && on_contact)
                     on_contact(*fa, *fb, true);
-            });
+            },
+            &ccd_workspace_);
     }
     AABB broadphase_bounds(const Body &body) const {
         AABB bounds = body_aabb(body);
@@ -551,6 +586,8 @@ class World {
     };
     bool locked_{false};
     std::set<std::pair<Fixture *, Fixture *>> active_contacts_;
+    std::vector<std::pair<Fixture *, Fixture *>> current_contacts_;
+    std::vector<std::uint64_t> current_triggers_;
     void require_unlocked() const {
         if (locked_)
             throw std::logic_error("Cannot mutate a stepping physics world");
@@ -637,6 +674,10 @@ class World {
         ConstraintPoint points[2]{};
         const Shape *shape_a{}, *shape_b{};
         Transform fixture_a{}, fixture_b{};
+        Transform detected_a{}, detected_b{};
+        Contact contact{};
+        Manifold manifold{};
+        bool event_contact{};
     };
     struct CachedContact {
         Constraint c;
@@ -648,7 +689,13 @@ class World {
     std::size_t cache_generation_{};
     std::map<ContactKey, CachedContact> contact_cache_;
     std::vector<Constraint> constraints_;
-    std::vector<Body *> projection_obstacles_;
+    std::vector<std::size_t> active_constraints_;
+    std::vector<ContactKey> solid_contacts_;
+    struct ProjectionObstacle {
+        Body *body;
+        AABB bounds;
+    };
+    std::vector<ProjectionObstacle> projection_obstacles_;
     StepStatistics step_statistics_{};
     double simulation_time_{};
     static float inv_mass(const Body &b) { return b.is_dynamic() ? b.inverse_mass : 0; }
@@ -667,6 +714,7 @@ class World {
         c.b->angular_velocity += rb.cross(impulse) * inv_inertia(*c.b);
     }
     void save_constraints(float dt) {
+        auto start = Clock::now();
         ++cache_generation_;
         for (auto &c : constraints_) {
             auto &cached = contact_cache_[c.key];
@@ -681,6 +729,7 @@ class World {
         std::erase_if(contact_cache_, [&](const auto &item) {
             return item.second.generation != cache_generation_;
         });
+        step_statistics_.cache_ms += milliseconds(start);
     }
     static ContactKey contact_key(const Fixture &a, const Fixture &b) {
         return {reinterpret_cast<std::uintptr_t>(a.body), reinterpret_cast<std::uintptr_t>(b.body),
@@ -712,6 +761,36 @@ class World {
                 return false;
         return true;
     }
+    void invalidate_edited_contacts() {
+        // Public transforms/shapes have no revision setter. Exact end-of-step
+        // snapshots distinguish user edits from normal integration. Destruction
+        // APIs clear the cache before releasing any pointed-to object.
+        std::erase_if(contact_cache_, [&](const auto &item) {
+            const auto &old = item.second;
+            auto &c = old.c;
+            auto edited = [&](Body *b, const Shape *shape, const Shape &saved,
+                              const Transform &transform, Transform local, std::uintptr_t fixture) {
+                return !same_transform(b->transform, transform) || !same_shape(*shape, saved) ||
+                       (fixture &&
+                        !same_transform(reinterpret_cast<const Fixture *>(fixture)->local, local));
+            };
+            bool changed =
+                edited(c.a, c.shape_a, old.shape_a, old.transform_a, c.fixture_a, c.key[2]) ||
+                edited(c.b, c.shape_b, old.shape_b, old.transform_b, c.fixture_b, c.key[3]);
+            bool enabled = true;
+            visit_pairs(*c.a, *c.b, [&](Fixture &a, Fixture &b) {
+                if (contact_key(a, b) == c.key)
+                    enabled = !a.trigger && !b.trigger && allowed(a, b);
+            });
+            if (changed || !enabled) {
+                if (c.a->type == BodyType::Dynamic)
+                    c.a->wake();
+                if (c.b->type == BodyType::Dynamic)
+                    c.b->wake();
+            }
+            return changed || !enabled;
+        });
+    }
     const Constraint *sleeping_cache(const Fixture &a, const Fixture &b) const {
         if (a.body->is_dynamic() || b.body->is_dynamic() || a.body->type == BodyType::Kinematic ||
             b.body->type == BodyType::Kinematic)
@@ -730,29 +809,61 @@ class World {
             return nullptr;
         return &old.c;
     }
+    const Constraint *geometry_cache(const Fixture &a, const Fixture &b) const {
+        auto it = contact_cache_.find(contact_key(a, b));
+        if (it == contact_cache_.end())
+            return nullptr;
+        const auto &old = it->second;
+        // Exact detection snapshots only: position correction, integration,
+        // public geometry edits and fixture offset changes invalidate reuse.
+        if (!same_transform(a.body->transform, old.c.detected_a) ||
+            !same_transform(b.body->transform, old.c.detected_b) ||
+            !same_transform(a.local, old.c.fixture_a) ||
+            !same_transform(b.local, old.c.fixture_b) || !same_shape(a.shape, old.shape_a) ||
+            !same_shape(b.shape, old.shape_b))
+            return nullptr;
+        return &old.c;
+    }
     void build_constraints(float dt, bool warm) {
         auto start = Clock::now();
+        double cache_before = step_statistics_.cache_ms;
         // During the second solve, impulses are already in velocities. Transfer
         // accumulators but do not apply them again.
         if (!warm)
             save_constraints(dt);
         constraints_.clear();
+        solid_contacts_.clear();
         projection_obstacles_.clear();
         for (auto &b : bodies_)
             if (b->type != BodyType::Dynamic)
-                projection_obstacles_.push_back(b.get());
-        auto pairs = candidate_pairs();
+                projection_obstacles_.push_back({b.get(), body_aabb(*b)});
+        std::sort(projection_obstacles_.begin(), projection_obstacles_.end(),
+                  [](const auto &a, const auto &b) { return a.bounds.min.x < b.bounds.min.x; });
+        const auto &pairs = candidate_pairs();
         for (auto [i, j] : pairs)
             visit_pairs(*bodies_[i], *bodies_[j], [&](Fixture &fa, Fixture &fb) {
                 if (!allowed(fa, fb) || fa.trigger || fb.trigger)
                     return;
                 if (auto cached = sleeping_cache(fa, fb)) {
                     constraints_.push_back(*cached);
+                    constraints_.back().friction =
+                        std::sqrt(std::max(0.0f, fa.material.friction * fb.material.friction));
+                    if (cached->event_contact)
+                        solid_contacts_.push_back(contact_key(fa, fb));
+                    ++step_statistics_.sleeping_contacts;
                     return;
                 }
                 Contact contact;
                 auto ta = fixture_transform(fa), tb = fixture_transform(fb);
-                bool touching = test(fa.shape, ta, fb.shape, tb, contact);
+                const auto *geometry = geometry_cache(fa, fb);
+                bool touching;
+                if (geometry) {
+                    contact = geometry->contact;
+                    touching = true;
+                    ++step_statistics_.cached_manifolds;
+                } else
+                    touching = test(fa.shape, ta, fb.shape, tb, contact);
+                bool event_contact = geometry ? geometry->event_contact : touching;
                 if (!touching && ccd_detail::supported(fa.shape) &&
                     ccd_detail::supported(fb.shape)) {
                     auto sep = ccd_detail::separation(fa.shape, ta, fb.shape, tb);
@@ -760,9 +871,12 @@ class World {
                         return;
                     contact = {sep.normal, sep.point, -sep.distance};
                     touching = true;
+                    event_contact = config_.ccd.enabled;
                 }
                 if (!touching)
                     return;
+                if (event_contact)
+                    solid_contacts_.push_back(contact_key(fa, fb));
                 if (!warm && on_contact_diagnostic && contact.penetration > 0)
                     on_contact_diagnostic({fa.body, fb.body, fa.body->velocity, fb.body->velocity,
                                            contact.normal, contact.penetration, fa.body->transform,
@@ -776,13 +890,19 @@ class World {
                 c.shape_b = fb.body->use_default_shape ? &fb.body->shape : &fb.shape;
                 c.fixture_a = fa.local;
                 c.fixture_b = fb.local;
+                c.detected_a = fa.body->transform;
+                c.detected_b = fb.body->transform;
+                c.contact = contact;
+                c.event_contact = event_contact;
                 c.key = {reinterpret_cast<std::uintptr_t>(c.a),
                          reinterpret_cast<std::uintptr_t>(c.b),
                          c.a->use_default_shape ? 0 : reinterpret_cast<std::uintptr_t>(&fa),
                          c.b->use_default_shape ? 0 : reinterpret_cast<std::uintptr_t>(&fb)};
                 c.friction = std::sqrt(std::max(0.0f, fa.material.friction * fb.material.friction));
-                auto m = contact_manifold(fa.shape, ta, fb.shape, tb, contact.normal, contact.point,
-                                          -contact.penetration);
+                auto m = geometry ? geometry->manifold
+                                  : contact_manifold(fa.shape, ta, fb.shape, tb, contact.normal,
+                                                     contact.point, -contact.penetration);
+                c.manifold = m;
                 c.count = m.count;
                 for (int k = 0; k < c.count; ++k) {
                     auto &p = c.points[k];
@@ -820,9 +940,19 @@ class World {
                 if (c.count)
                     constraints_.push_back(c);
             });
+        auto wake_start = Clock::now();
         wake_connected();
+        double wake_ms = milliseconds(wake_start);
+        step_statistics_.sleeping_ms += wake_ms;
+        std::sort(solid_contacts_.begin(), solid_contacts_.end());
+        active_constraints_.clear();
+        for (std::size_t i = 0; i < constraints_.size(); ++i)
+            if (constraints_[i].a->is_dynamic() || constraints_[i].b->is_dynamic())
+                active_constraints_.push_back(i);
+        step_statistics_.active_constraints = active_constraints_.size();
         if (warm)
-            for (auto &c : constraints_) {
+            for (auto i : active_constraints_) {
+                auto &c = constraints_[i];
                 if (!c.a->is_dynamic() && !c.b->is_dynamic())
                     continue;
                 for (int k = 0; k < c.count; ++k) {
@@ -837,12 +967,14 @@ class World {
                 }
             }
         step_statistics_.constraints = constraints_.size();
-        step_statistics_.detection_ms += milliseconds(start);
+        step_statistics_.detection_ms +=
+            milliseconds(start) - wake_ms - (step_statistics_.cache_ms - cache_before);
     }
     void solve_velocities() {
         auto start = Clock::now();
         for (int iteration = 0; iteration < config_.solver_iterations; ++iteration)
-            for (auto &c : constraints_) {
+            for (auto i : active_constraints_) {
+                auto &c = constraints_[i];
                 float ma = inv_mass(*c.a), mb = inv_mass(*c.b), ia = inv_inertia(*c.a),
                       ib = inv_inertia(*c.b);
                 if (ma + mb <= 0)
@@ -907,21 +1039,33 @@ class World {
             std::abs(after.angle - before.angle) < 1e-8f)
             return;
         float fraction = 1;
-        for (auto *obstacle : projection_obstacles_) {
-            if (!body_aabb(body).overlaps(body_aabb(*obstacle))) {
-                auto bounds = body_aabb(body);
-                auto delta = before.position - after.position;
-                bounds.min.x += std::min(0.0f, delta.x);
-                bounds.min.y += std::min(0.0f, delta.y);
-                bounds.max.x += std::max(0.0f, delta.x);
-                bounds.max.y += std::max(0.0f, delta.y);
-                if (std::abs(after.angle - before.angle) < 1e-8f &&
-                    !bounds.overlaps(body_aabb(*obstacle)))
-                    continue;
-            }
+        // Bound the full correction path, not just its endpoints. Every point
+        // rotates by at most radius * angle; the endpoint AABB bounds radius
+        // about the body pivot even for offset and compound fixtures.
+        auto bounds = body_aabb(body);
+        Vec2 reach{std::max(std::abs(bounds.min.x - after.position.x),
+                            std::abs(bounds.max.x - after.position.x)),
+                   std::max(std::abs(bounds.min.y - after.position.y),
+                            std::abs(bounds.max.y - after.position.y))};
+        float padding = reach.length() * std::min(2.0f, std::abs(after.angle - before.angle));
+        auto delta = before.position - after.position;
+        bounds.min -= Vec2{padding, padding};
+        bounds.max += Vec2{padding, padding};
+        bounds.min.x += std::min(0.0f, delta.x);
+        bounds.min.y += std::min(0.0f, delta.y);
+        bounds.max.x += std::max(0.0f, delta.x);
+        bounds.max.y += std::max(0.0f, delta.y);
+        for (const auto &entry : projection_obstacles_) {
+            if (entry.bounds.min.x > bounds.max.x)
+                break;
+            if (!bounds.overlaps(entry.bounds))
+                continue;
+            ++step_statistics_.projection_candidates;
+            auto *obstacle = entry.body;
             visit_pairs(body, *obstacle, [&](Fixture &a, Fixture &b) {
                 if (a.trigger || b.trigger || !allowed(a, b))
                     return;
+                ++step_statistics_.projection_sweeps;
                 if (ccd_detail::supported(a.shape) && ccd_detail::supported(b.shape)) {
                     ShapeSweep projection{before, after, a.local};
                     auto bt = fixture_transform(b);
@@ -963,8 +1107,12 @@ class World {
                 (c.b->transform.position + rb - c.a->transform.position - ra).dot(c.normal);
             float correction =
                 std::clamp(-separation - 0.001f, 0.0f, config_.max_position_correction);
+            step_statistics_.max_penetration =
+                std::max(step_statistics_.max_penetration, -separation);
+            step_statistics_.max_correction = std::max(step_statistics_.max_correction, correction);
             if (correction == 0)
                 continue;
+            ++step_statistics_.position_corrections;
             auto before_a = c.a->transform, before_b = c.b->transform;
             float na = ra.cross(c.normal), nb = rb.cross(c.normal);
             float impulse = correction * (config_.solver_mode == SolverMode::PBD ? 1.0f : 0.2f) /
@@ -983,33 +1131,76 @@ class World {
     }
     // Static floors do not merge unrelated islands. Contacts and joints connect
     // dynamic bodies; an island sleeps only when every member is quiet.
-    std::vector<std::vector<Body *>> islands() {
-        std::map<Body *, std::size_t> index;
+    std::vector<Body *> island_bodies_, previous_island_bodies_;
+    std::vector<std::pair<Body *, Body *>> island_edges_, previous_island_edges_;
+    std::vector<std::pair<Body *, std::size_t>> island_index_;
+    std::vector<std::size_t> island_parent_;
+    std::vector<std::vector<Body *>> island_groups_;
+    const std::vector<std::vector<Body *>> &islands() {
+        island_bodies_.clear();
+        island_edges_.clear();
         for (auto &b : bodies_)
             if (b->type == BodyType::Dynamic)
-                index.emplace(b.get(), index.size());
-        std::vector<std::size_t> parent(index.size());
-        for (std::size_t i = 0; i < parent.size(); ++i)
-            parent[i] = i;
+                island_bodies_.push_back(b.get());
+        auto edge = [&](Body *a, Body *b) {
+            if (a->type == BodyType::Dynamic && b->type == BodyType::Dynamic)
+                island_edges_.emplace_back(a, b);
+        };
+        for (auto &c : constraints_)
+            edge(c.a, c.b);
+        for (auto &j : joints_)
+            edge(j->a, j->b);
+        if (island_bodies_ == previous_island_bodies_ && island_edges_ == previous_island_edges_)
+            return island_groups_;
+        previous_island_bodies_ = island_bodies_;
+        previous_island_edges_ = island_edges_;
+        island_index_.clear();
+        island_parent_.resize(island_bodies_.size());
+        for (std::size_t i = 0; i < island_bodies_.size(); ++i) {
+            island_index_.emplace_back(island_bodies_[i], i);
+            island_parent_[i] = i;
+        }
+        auto less = [](const auto &a, const auto &b) {
+            return std::less<Body *>{}(a.first, b.first);
+        };
+        std::sort(island_index_.begin(), island_index_.end(), less);
+        auto index = [&](Body *b) {
+            return std::lower_bound(island_index_.begin(), island_index_.end(),
+                                    std::make_pair(b, std::size_t{}), less)
+                ->second;
+        };
         auto root = [&](std::size_t i) {
-            while (parent[i] != i) {
-                parent[i] = parent[parent[i]];
-                i = parent[i];
+            while (island_parent_[i] != i) {
+                island_parent_[i] = island_parent_[island_parent_[i]];
+                i = island_parent_[i];
             }
             return i;
         };
-        auto join = [&](Body *a, Body *b) {
-            if (index.contains(a) && index.contains(b))
-                parent[root(index[a])] = root(index[b]);
+        for (auto [a, b] : island_edges_)
+            island_parent_[root(index(a))] = root(index(b));
+        island_groups_.resize(island_bodies_.size());
+        for (auto &g : island_groups_)
+            g.clear();
+        for (auto [b, i] : island_index_)
+            island_groups_[root(i)].push_back(b);
+        return island_groups_;
+    }
+    void wake_neighbors(Body &body) {
+        if (body.type == BodyType::Dynamic)
+            body.wake();
+        auto wake = [&](Body *a, Body *b) {
+            if (a != &body && b != &body)
+                return;
+            if (a->type == BodyType::Dynamic)
+                a->wake();
+            if (b->type == BodyType::Dynamic)
+                b->wake();
         };
         for (auto &c : constraints_)
-            join(c.a, c.b);
+            wake(c.a, c.b);
         for (auto &j : joints_)
-            join(j->a, j->b);
-        std::vector<std::vector<Body *>> groups(parent.size());
-        for (auto [b, i] : index)
-            groups[root(i)].push_back(b);
-        return groups;
+            wake(j->a, j->b);
+        wake_connected();
     }
     void wake_connected() {
         for (auto &c : constraints_) {
@@ -1032,13 +1223,22 @@ class World {
     }
     void update_sleep() {
         for (auto &group : islands()) {
+            if (group.empty())
+                continue;
+            ++step_statistics_.sleep_groups;
             bool quiet = true;
             int counter = 31;
             for (auto *b : group) {
+                step_statistics_.max_speed =
+                    std::max(step_statistics_.max_speed, b->velocity.length());
+                step_statistics_.max_angular_speed =
+                    std::max(step_statistics_.max_angular_speed, std::abs(b->angular_velocity));
                 quiet &=
                     b->velocity.length_squared() < 0.0025f && std::abs(b->angular_velocity) < 0.05f;
                 counter = std::min(counter, b->sleep_counter);
             }
+            step_statistics_.moving_groups += !quiet;
+            step_statistics_.settling_groups += quiet && counter < 31;
             for (auto *b : group) {
                 b->sleep_counter = quiet ? counter + 1 : 0;
                 if (b->sleep_counter > 30) {
@@ -1046,6 +1246,7 @@ class World {
                     b->velocity = {};
                     b->angular_velocity = 0;
                 }
+                step_statistics_.awake_bodies += !b->sleeping;
             }
         }
     }
@@ -1068,69 +1269,76 @@ class World {
         else
             on_trigger(b, a, enter);
     }
-    std::vector<std::pair<std::size_t, std::size_t>> candidate_pairs() const {
-        std::vector<AABB> bounds_cache;
-        bounds_cache.reserve(bodies_.size());
-        for (auto &b : bodies_)
-            bounds_cache.push_back(broadphase_bounds(*b));
-        std::unordered_set<std::uint64_t> unique;
+    std::vector<AABB> pair_bounds_;
+    std::vector<BodyType> pair_types_;
+    std::vector<std::pair<std::uint64_t, std::size_t>> cell_entries_;
+    std::vector<std::size_t> large_entries_;
+    std::vector<std::pair<std::size_t, std::size_t>> pair_buffer_;
+    const std::vector<std::pair<std::size_t, std::size_t>> &candidate_pairs(bool refresh = true) {
+        if (!refresh)
+            return pair_buffer_; // No transforms changed since constraint detection.
+        bool changed = pair_bounds_.size() != bodies_.size();
+        pair_bounds_.resize(bodies_.size());
+        pair_types_.resize(bodies_.size());
+        for (std::size_t i = 0; i < bodies_.size(); ++i) {
+            auto bounds = broadphase_bounds(*bodies_[i]);
+            changed |= bounds.min != pair_bounds_[i].min || bounds.max != pair_bounds_[i].max ||
+                       pair_types_[i] != bodies_[i]->type;
+            pair_bounds_[i] = bounds;
+            pair_types_[i] = bodies_[i]->type;
+        }
+        if (!changed)
+            return pair_buffer_;
+        pair_buffer_.clear();
+        auto append = [&](std::size_t a, std::size_t b) {
+            auto i = std::min(a, b), j = std::max(a, b);
+            if (i != j &&
+                (pair_types_[i] == BodyType::Dynamic || pair_types_[j] == BodyType::Dynamic) &&
+                pair_bounds_[i].overlaps(pair_bounds_[j]))
+                pair_buffer_.emplace_back(i, j);
+        };
         if (!config_.enable_broadphase) {
             for (std::size_t i = 0; i < bodies_.size(); ++i)
                 for (std::size_t j = i + 1; j < bodies_.size(); ++j)
-                    if (bodies_[i]->type == BodyType::Dynamic ||
-                        bodies_[j]->type == BodyType::Dynamic)
-                        unique.insert(pair_key(i, j));
+                    append(i, j);
         } else {
-            std::unordered_map<std::uint64_t, std::vector<std::size_t>> cells;
-            std::vector<std::size_t> large;
+            cell_entries_.clear();
+            large_entries_.clear();
             const float cell = std::max(config_.broadphase_cell_size, 0.01f);
-            auto cell_key = [](int x, int y) {
-                return (std::uint64_t(std::uint32_t(x)) << 32) | std::uint32_t(y);
-            };
             for (std::size_t i = 0; i < bodies_.size(); ++i) {
-                const AABB bounds = bounds_cache[i];
-                const int min_x = int(std::floor(bounds.min.x / cell)),
-                          max_x = int(std::floor(bounds.max.x / cell));
-                const int min_y = int(std::floor(bounds.min.y / cell)),
-                          max_y = int(std::floor(bounds.max.y / cell));
-                const std::size_t count =
-                    std::size_t(max_x - min_x + 1) * std::size_t(max_y - min_y + 1);
+                auto b = pair_bounds_[i];
+                int x0 = int(std::floor(b.min.x / cell)), x1 = int(std::floor(b.max.x / cell));
+                int y0 = int(std::floor(b.min.y / cell)), y1 = int(std::floor(b.max.y / cell));
+                auto count = std::uint64_t(std::int64_t(x1) - x0 + 1) *
+                             std::uint64_t(std::int64_t(y1) - y0 + 1);
                 if (count > config_.broadphase_max_cells_per_body) {
-                    large.push_back(i);
+                    large_entries_.push_back(i);
                     continue;
                 }
-                for (int x = min_x; x <= max_x; ++x)
-                    for (int y = min_y; y <= max_y; ++y)
-                        cells[cell_key(x, y)].push_back(i);
+                for (int x = x0; x <= x1; ++x)
+                    for (int y = y0; y <= y1; ++y)
+                        cell_entries_.emplace_back(
+                            (std::uint64_t(std::uint32_t(x)) << 32) | std::uint32_t(y), i);
             }
-            for (const auto &[key, list] : cells) {
-                (void)key;
-                for (std::size_t a = 0; a < list.size(); ++a)
-                    for (std::size_t b = a + 1; b < list.size(); ++b) {
-                        const auto i = std::min(list[a], list[b]), j = std::max(list[a], list[b]);
-                        if (bodies_[i]->type == BodyType::Dynamic ||
-                            bodies_[j]->type == BodyType::Dynamic)
-                            unique.insert(pair_key(i, j));
-                    }
+            std::sort(cell_entries_.begin(), cell_entries_.end());
+            for (std::size_t begin = 0; begin < cell_entries_.size();) {
+                std::size_t end = begin + 1;
+                while (end < cell_entries_.size() &&
+                       cell_entries_[end].first == cell_entries_[begin].first)
+                    ++end;
+                for (std::size_t a = begin; a < end; ++a)
+                    for (std::size_t b = a + 1; b < end; ++b)
+                        append(cell_entries_[a].second, cell_entries_[b].second);
+                begin = end;
             }
-            for (const auto i : large)
+            for (auto i : large_entries_)
                 for (std::size_t j = 0; j < bodies_.size(); ++j)
-                    if (i != j) {
-                        const auto a = std::min(i, j), b = std::max(i, j);
-                        if (bodies_[a]->type == BodyType::Dynamic ||
-                            bodies_[b]->type == BodyType::Dynamic)
-                            unique.insert(pair_key(a, b));
-                    }
+                    append(i, j);
         }
-        std::vector<std::pair<std::size_t, std::size_t>> result;
-        result.reserve(unique.size());
-        for (const auto key : unique) {
-            const auto [i, j] = unpack_key(key);
-            if (bounds_cache[i].overlaps(bounds_cache[j]))
-                result.emplace_back(i, j);
-        }
-        std::sort(result.begin(), result.end());
-        return result;
+        std::sort(pair_buffer_.begin(), pair_buffer_.end());
+        pair_buffer_.erase(std::unique(pair_buffer_.begin(), pair_buffer_.end()),
+                           pair_buffer_.end());
+        return pair_buffer_;
     }
     Body &add_body(std::unique_ptr<Body> body) {
         require_unlocked();

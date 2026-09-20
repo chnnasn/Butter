@@ -73,6 +73,7 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_2d_stability` | Large landings, long resting stacks and connected wake/sleep |
 | `test_2d_tomcat_stack` | Original TomCat box parameters, time advancement and floor checks |
 | `test_2d_tomcat_circles` | 1,000-circle TomCat regression (runs `test_2d_tomcat_stack 1000 circles`) |
+| `test_2d_optimization` | Broadphase oracle, cache invalidation, support removal/waking and CCD workspace |
 
 Run all tests:
 
@@ -159,8 +160,8 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-At `ea8ef90`, all 16 Release CTest cases passed (15 binaries); the three targeted
-Debug CCD/TomCat regressions also passed. These are repository regressions,
+The serial optimization follow-up passes all 17 CTest cases (16 binaries) in
+both Release and Debug. These are repository regressions,
 separate from the external benchmark below. On Windows, inspect
 the PBD crate stack and explosion demo with:
 
@@ -188,7 +189,7 @@ for (int i = 0; i < 120; ++i) world.step();
 ```
 
 The 2D module includes circle, box, capsule, convex polygon and indexed
-triangle mesh narrow phase, spatial-hash broadphase, PBD/impulse projection,
+triangle mesh narrow phase, spatial-grid broadphase, PBD/impulse projection,
 friction, angular motion, sleeping, collision filtering, enter/exit triggers,
 raycast/AABB queries, distance constraints and a `physics2d_playground`
 example. `bench_2d [count] [boxes]` checks landing correctness before reporting active and sleeping costs separately. A dedicated internal mesh BVH remains a future optimization. The 2D module now
@@ -275,6 +276,14 @@ filters, sleeping bodies, contact transitions, budget fallback, and a determinis
 dense-time collision oracle. Its checks stay enabled in Release builds.
 
 ## 2D benchmark report (2026-09-21)
+
+**Serial optimization follow-up:** a same-session rerun against `ea8ef90` measured
+1,000-box stepping at **55.152 → 13.968 ms**, circles at **6.888 → 1.470 ms**, and
+separated motion at **1.351 → 0.221 ms**. The 500/1,000-box scenes settle at about
+9.57/12.17 seconds and stay asleep through 60 seconds. See the
+[bilingual implementation and validation report](docs/serial-optimization.md)
+for cache rules, matched-activity allocation diagnostics, raw samples and limits.
+The report below preserves the earlier `ea8ef90` versus Box2D measurement.
 
 Test environment and integration: [TomCat Engine — `dev_butter`](https://github.com/chnnasn/TomCat_Engine/tree/dev_butter).
 This run tested **Butter `ea8ef90`** through that branch's physics adapter against

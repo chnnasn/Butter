@@ -31,13 +31,15 @@ using namespace butter::physics2d;
 struct Totals {
     int frames{};
     std::size_t active_body_steps{}, allocations{}, bytes{};
-    double total{}, ccd{}, detection{}, velocity{}, position{}, allocation{};
+    double total{}, ccd{}, detection{}, velocity{}, position{}, sleeping{}, cache{}, allocation{};
+    std::size_t projection_candidates{}, cached_manifolds{}, sleeping_contacts{};
 };
 int main(int argc, char **argv) try {
     int count = argc > 1 ? std::stoi(argv[1]) : 100;
     if (count < 1 || count > 10000)
         throw std::invalid_argument("body count must be 1..10000");
     bool boxes = argc > 2 && std::string(argv[2]) == "boxes";
+    bool keep_awake = argc > 3 && std::string(argv[3]) == "awake";
     World w;
     w.create_body().static_body().at(0, -.05f).box(float(count), .05f).build();
     std::vector<Body *> bodies;
@@ -53,6 +55,11 @@ int main(int argc, char **argv) try {
     Totals totals[2];
     int limited = 0;
     for (int frame = 0; frame < 360; ++frame) {
+        // An explicit workload mode, not a relaxation of the engine's sleep
+        // thresholds. Compare this only with other forced-awake runs.
+        if (keep_awake)
+            for (auto *b : bodies)
+                b->wake();
         int active = 0;
         for (auto *b : bodies)
             active += !b->sleeping;
@@ -72,6 +79,11 @@ int main(int argc, char **argv) try {
         t.detection += s.detection_ms;
         t.velocity += s.velocity_ms;
         t.position += s.position_ms;
+        t.sleeping += s.sleeping_ms;
+        t.cache += s.cache_ms;
+        t.projection_candidates += s.projection_candidates;
+        t.cached_manifolds += s.cached_manifolds;
+        t.sleeping_contacts += s.sleeping_contacts;
         t.allocations += allocation_calls - calls;
         t.bytes += allocation_bytes - bytes;
         t.allocation += allocation_ms - ams;
@@ -83,20 +95,26 @@ int main(int argc, char **argv) try {
             throw std::runtime_error("correctness gate: lost independent motion time");
     }
     for (auto *b : bodies)
-        if (!b->sleeping)
+        if (!keep_awake && !b->sleeping)
             throw std::runtime_error("correctness gate: failed to sleep");
     if (std::abs(w.simulation_time() - 6) > 1e-5)
         throw std::runtime_error("correctness gate: lost simulation time");
     if (limited)
         throw std::runtime_error("correctness gate: simple landings required CCD clamps");
     std::cout << "PASS count=" << count << " shape=" << (boxes ? "boxes" : "circles")
-              << " simulated_seconds=" << w.simulation_time() << " sleeping=" << count << '\n';
+              << " simulated_seconds=" << w.simulation_time()
+              << " sleeping=" << (keep_awake ? 0 : count)
+              << " mode=" << (keep_awake ? "forced_awake" : "natural_sleep") << '\n';
     for (int i = 0; i < 2; ++i) {
         auto &t = totals[i];
         std::cout << (i ? "sleeping" : "active") << " frames=" << t.frames
                   << " active_body_steps=" << t.active_body_steps << " total_ms=" << t.total
                   << " ccd_ms=" << t.ccd << " detection_ms=" << t.detection
                   << " velocity_ms=" << t.velocity << " position_ms=" << t.position
+                  << " cache_ms=" << t.cache << " sleeping_ms=" << t.sleeping
+                  << " projection_candidates=" << t.projection_candidates
+                  << " cached_manifolds=" << t.cached_manifolds
+                  << " sleeping_contacts=" << t.sleeping_contacts
                   << " ordinary_allocations=" << t.allocations << " allocated_bytes=" << t.bytes
                   << " allocation_ms_inclusive=" << t.allocation << '\n';
     }

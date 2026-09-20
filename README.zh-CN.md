@@ -73,6 +73,7 @@ ctest --test-dir build
 | `test_2d_stability` | 大规模落地、箱堆长期静置与关联唤醒/休眠 |
 | `test_2d_tomcat_stack` | TomCat 原始箱体参数、实际时间推进与地板检查 |
 | `test_2d_tomcat_circles` | TomCat 1,000 圆形回归（运行 `test_2d_tomcat_stack 1000 circles`） |
+| `test_2d_optimization` | 宽相暴力枚举对照、缓存失效、支撑销毁/唤醒与 CCD 缓冲 |
 
 运行全部测试：
 
@@ -156,7 +157,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ea8ef90` 已通过全部 16 个 Release CTest 用例（15 个测试程序），以及 3 个 Debug CCD/TomCat 定向回归。
+串行优化后的 Release、Debug 均通过全部 17 个 CTest 用例（16 个测试程序）。
 这些是仓库回归测试，与下方外部基准测试分开记录。Windows 下查看 PBD 箱子堆和爆炸示例：
 
 ```powershell
@@ -182,7 +183,7 @@ for (int i = 0; i < 120; ++i) world.step();
 ```
 
 当前 2D 模块包含圆、盒、胶囊、凸多边形和索引三角网格窄相位，
-spatial-hash broadphase、PBD/冲量投影、摩擦、角运动、睡眠、碰撞过滤、
+spatial-grid broadphase、PBD/冲量投影、摩擦、角运动、睡眠、碰撞过滤、
 enter/exit trigger、raycast/AABB 查询、距离约束，以及
 `physics2d_playground` 示例。`bench_2d [count] [boxes]` 先检查落地正确性，再分别报告活动与休眠阶段耗时。
 圆、盒和凸多边形已支持保守扫掠 CCD；专用网格内部 BVH 仍属于后续优化。
@@ -240,6 +241,12 @@ fixture 掩码、自定义过滤与关节禁碰设置均生效。显式 fixture 
 Release 构建保留这些检查。
 
 ## 2D 基准测试报告（2026-09-21）
+
+**串行优化后续复测：**同轮对照 `ea8ef90`，1,000 箱体从 **55.152 降至 13.968 ms／步**，
+圆形为 **6.888 → 1.470 ms**，分散移动为 **1.351 → 0.221 ms**。
+500／1,000 箱体约在 9.57／12.17 秒全部休眠，并保持到 60 秒。
+缓存规则、匹配活动量的分配诊断、原始数据与限制见[中英文实现及验证记录](docs/serial-optimization.zh-CN.md)。
+下文保留此前 `ea8ef90` 与 Box2D 的历史测量。
 
 测试环境与接入代码：[TomCat Engine — `dev_butter`](https://github.com/chnnasn/TomCat_Engine/tree/dev_butter)。
 本轮使用 **Butter `ea8ef90`** 和该分支的物理适配层，对照库为 TomCat `main` 分支使用的 **Box2D 2.4.1**。

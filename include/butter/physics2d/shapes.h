@@ -93,10 +93,13 @@ inline AABB compute_aabb(const Shape& shape, const Transform& t) {
         for (const auto& triangle : mesh->triangles) { const AABB part = compute_aabb(Shape{triangle}, t); result.min.x = std::min(result.min.x, part.min.x); result.min.y = std::min(result.min.y, part.min.y); result.max.x = std::max(result.max.x, part.max.x); result.max.y = std::max(result.max.y, part.max.y); }
         return result;
     }
-    const auto vertices = world_vertices(shape, t);
+    // Polygon bounds do not need an allocated world-space vertex array.
+    const auto& vertices = std::get<Polygon>(shape).vertices;
     if (vertices.empty()) return {t.position, t.position};
-    AABB result{vertices[0], vertices[0]};
-    for (const auto& v : vertices) {
+    const Vec2 first = t.position + rotate(vertices[0], t.angle);
+    AABB result{first, first};
+    for (const auto& local : vertices) {
+        const Vec2 v = t.position + rotate(local, t.angle);
         result.min.x = std::min(result.min.x, v.x); result.min.y = std::min(result.min.y, v.y);
         result.max.x = std::max(result.max.x, v.x); result.max.y = std::max(result.max.y, v.y);
     }
