@@ -9,6 +9,9 @@
 
 Butter aims for a C#/TypeScript-like fluent API while keeping C++ performance and zero-overhead abstraction.
 
+Both 3D and 2D APIs are available. The quick start below uses 3D; the latest
+optimization and [benchmark results](#2d-benchmark-report-2026-09-21) concern 2D.
+
 ## Quick Start
 
 ```cpp
@@ -67,13 +70,13 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_shapes` | Capsule, convex and indexed-triangle narrow phase |
 | `test_broadphase` | Spatial-hash broadphase, AABB query and large proxies |
 | `test_2d` | 2D bodies, collisions, queries and constraints |
-| `test_2d_ccd` | Swept CCD, thin walls, angular motion, failure isolation and contact precision |
+| `test_2d_ccd` | Thin walls, angular/offset sweeps, compound position corrections, 4–64 vertex polygons and failure isolation |
 | `test_2d_engine` | Explicit fixtures, engine integration and contact lifecycle |
 | `test_3d_namespace` | Explicit 3D namespace compatibility |
 | `test_2d_stability` | Large landings, long resting stacks and connected wake/sleep |
 | `test_2d_tomcat_stack` | Original TomCat box parameters, time advancement and floor checks |
 | `test_2d_tomcat_circles` | 1,000-circle TomCat regression (runs `test_2d_tomcat_stack 1000 circles`) |
-| `test_2d_optimization` | Broadphase oracle, cache invalidation, support removal/waking and CCD workspace |
+| `test_2d_optimization` | Broadphase oracle, cache invalidation, sleeping-world fast path, kinematic motion and vertex/CCD buffers |
 
 Run all tests:
 
@@ -160,7 +163,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The serial optimization follow-up passes all 17 CTest cases (16 binaries) in
+Revision `a8e4336` passes all 17 CTest cases (16 binaries) in
 both Release and Debug. These are repository regressions,
 separate from the external benchmark below. On Windows, inspect
 the PBD crate stack and explosion demo with:
@@ -192,7 +195,10 @@ The 2D module includes circle, box, capsule, convex polygon and indexed
 triangle mesh narrow phase, spatial-grid broadphase, PBD/impulse projection,
 friction, angular motion, sleeping, collision filtering, enter/exit triggers,
 raycast/AABB queries, distance constraints and a `physics2d_playground`
-example. `bench_2d [count] [boxes]` checks landing correctness before reporting active and sleeping costs separately. A dedicated internal mesh BVH remains a future optimization. The 2D module now
+example. `bench_2d [count] [circles|boxes] [awake]` checks landing correctness and
+reports active and sleeping costs separately; `awake` explicitly keeps bodies
+active for comparisons. This internal landing benchmark differs from the TomCat
+stack benchmark below. A dedicated internal mesh BVH remains a future optimization. The 2D module now
 includes conservative swept CCD for circles, boxes and convex polygons.
 
 ### Engine integration with explicit fixtures
@@ -277,6 +283,76 @@ dense-time collision oracle. Its checks stay enabled in Release builds.
 
 ## 2D benchmark report (2026-09-21)
 
+### Latest: `a8e4336` against `9baad05`
+
+The latest changes reduce CCD geometry allocations and reject distant obstacles
+before rebuilding position-correction bounds. Potential hits still run the full
+CCD guard. Earlier changes precompute velocity constraints, reuse contact geometry
+and skip redundant CCD/detection in fully sleeping worlds. Solver iterations,
+sleep thresholds and CCD budgets were not relaxed; the solver remains serial.
+
+Environment and adapter: [TomCat Engine — `dev_butter`](https://github.com/chnnasn/TomCat_Engine/tree/dev_butter).
+These local tests use an isolated copy of that adapter with Butter headers; they
+do not update the engine branch's pinned dependency. Release, single thread,
+1/60 s, 60 warm-up steps and 300 measured steps; six alternating old/new rounds,
+discard the first and take the median of five. Timings are milliseconds per step.
+
+| Scene | Bodies | `9baad05` | `a8e4336` |
+| --- | ---: | ---: | ---: |
+| Separated motion | 100 | 0.019314 | 0.018888 |
+| Separated motion | 500 | 0.099302 | 0.098543 |
+| Separated motion | 1,000 | 0.212034 | 0.210657 |
+| Falling circles | 100 | 0.026110 | 0.027397 |
+| Falling circles | 500 | 0.356339 | 0.338405 |
+| Falling circles | 1,000 | 1.139450 | 1.033050 |
+| Box stacks | 100 | 0.068556 | 0.059709 |
+| Box stacks | 500 | 5.405940 | 4.081260 |
+| Box stacks | 1,000 | 12.166300 | 9.203220 |
+
+500/1,000 boxes take about **25%/24% less time**, and 1,000 circles about **9% less**.
+Separated motion is comparable. The 100-circle scene is about 1.29 microseconds
+slower (5%); this is not a universal speedup. These are Butter-to-Butter results,
+not new Box2D ratios. A mean below 16.67 ms does not guarantee every step meets 60 Hz.
+
+All nine scenes match the old version's per-step state hashes and active-body-step
+counts. All timed runs advance five measured seconds with zero CCD limits, budget
+exhaustion, nonconvergence, zero-time repeats, nonfinite positions or detected
+below-ground centers. The stricter native 500/1,000-box tests check floor geometry
+throughout 60 seconds: all bodies first sleep at **9.57/12.17 seconds** and remain
+asleep. Their awake state at six seconds is not evidence of a permanent sleep failure.
+These results validate the supplied scenes, not arbitrary physics workloads.
+
+`world.step_statistics()` exposes CCD, detection, velocity, position, cache and
+sleeping times, activity counts, `stationary_steps` and `projection_fast_rejections`.
+In a separate 1,000-box diagnostic, position solving fell from about 4.03 to
+1.49 ms/step with unchanged correction/candidate counts. Contact detection remains
+a major cost; compare activity and trajectories before further performance claims.
+
+See [implementation, invalidation rules and validation](docs/serial-optimization.md)
+and [108 raw samples](docs/benchmarks/projection-followup-20260921.csv).
+The raw file's `baseline9` means `9baad05`; `retest` means the code committed as `a8e4336`.
+Reproduction commands are in the [examples and diagnostics guide](examples/README.md#2d-regressions-and-benchmarks).
+
+### External Box2D reference: `52f15a5`
+
+The supplied later TomCat report compared Butter `52f15a5` with Box2D 2.4.1 on an
+i7-14650HX using Release, one thread and the same warm-up/measurement schedule:
+
+| Scene (1,000 bodies) | Box2D | Butter `52f15a5` | Butter / Box2D |
+| --- | ---: | ---: | ---: |
+| Separated motion | 0.2118 ms | 0.2217 ms | 1.05× |
+| Falling circles | 0.5340 ms | 1.4868 ms | 2.78× |
+| Box stacks | 3.0651 ms | 13.6228 ms | 4.44× |
+
+Separated motion was effectively on par; dense contacts remained several times
+slower. The adapter used updated Butter in an isolated directory because the
+branch still pinned an older dependency at the time. Different engine trajectories
+and sleep schedules make these same-initial-scene costs, not equal-quality throughput.
+Do not divide the latest local timings by these older Box2D timings to claim a new ratio.
+
+<details>
+<summary>Historical report: ea8ef90 and the first serial optimization</summary>
+
 **Serial optimization follow-up:** a same-session rerun against `ea8ef90` measured
 1,000-box stepping at **55.152 → 13.968 ms**, circles at **6.888 → 1.470 ms**, and
 separated motion at **1.351 → 0.221 ms**. The 500/1,000-box scenes settle at about
@@ -287,8 +363,8 @@ The report below preserves the earlier `ea8ef90` versus Box2D measurement.
 
 Test environment and integration: [TomCat Engine — `dev_butter`](https://github.com/chnnasn/TomCat_Engine/tree/dev_butter).
 This run tested **Butter `ea8ef90`** through that branch's physics adapter against
-**Box2D 2.4.1** from TomCat's `main` branch. **`dev_butter` still pins an older
-Butter revision**: these results use the latest headers in an isolated test
+**Box2D 2.4.1** from TomCat's `main` branch. **At the time, `dev_butter` pinned an older
+Butter revision**: these results used updated headers in an isolated test
 directory, not an updated dependency in the engine branch.
 
 Hardware and build: Intel Core i7-14650HX, Windows x64, MSVC 19.50.35724,
@@ -344,16 +420,17 @@ reproduced world stall, ground crossing and zero-time repeat failures did not
 recur in these cases. This limited validation does not replace comprehensive
 physics correctness testing.
 
-At about **51 ms per step**, the 1,000-box scene still exceeds the **16.67 ms**
-budget for 60 Hz. Next priorities are contact solving, CCD candidate processing,
-sleep overhead and the causes of persistent wakefulness, with activity state
-reported alongside timing.
+At about **51 ms per step**, this historical `ea8ef90` result exceeded the
+**16.67 ms** budget for 60 Hz. The newer measurements and sleep investigation
+above supersede that performance assessment.
 
 The supplied source, raw data and reproduction instructions are in the local
 TomCat checkout at `.scratch/comparison-20260921-r2/README.md` (not published by
 the branch link above). See also the repository's
 [CCD follow-up](docs/ccd-zero-time-followup.md) for implementation diagnostics
 and regression coverage; its local timing run is separate from this report.
+
+</details>
 
 ## Examples
 
@@ -394,12 +471,15 @@ dependency and is never vendored into Butter.
 - Explosion + dynamic fracture demo
 - 2D convex CCD, persistent contact manifolds, warm starting and connected sleeping
 - Original TomCat circle/box regressions and activity-aware timing diagnostics
+- Cached velocity geometry, small CCD vertex buffers and sleeping-world fast path
+- Conservative position-correction prefilter covering compound fixture offsets
 
 ### Near-term
 
 - Extend CCD to 3D, capsules and meshes
 - Better stacking stability and contact quality
-- Profile contact solving, CCD candidates and sleeping before parallelizing
+- Reduce dense-contact detection and cache overhead with matched-activity benchmarks
+- Preserve thin-wall CCD and long-term stability while optimizing serial work
 - More joints: slider, fixed, motor
 
 ### Mid-term
