@@ -143,3 +143,55 @@ timing medians. Source harness outputs are retained locally under
 `build/tomcat-serial-stages.txt`, `build/tomcat-serial-adapter.txt` and
 `build/alloc-{baseline,serial}-{natural,awake}.txt`. The adapter callback profile
 uses scope timers in a copied adapter; the primary timing binaries do not.
+
+## Contact workload follow-up against `52f15a5`
+
+This follow-up precomputes contact arms and effective-mass denominators once per
+velocity pass, keeps up to 16 temporary convex vertices on the stack, and shares
+one contact-cache lookup across geometry reuse and warm starting. Larger polygons
+retain an unrestricted heap fallback. Velocity iteration count, impulse ordering,
+position correction and CCD safety checks are unchanged.
+
+A world with all dynamics asleep and no moving kinematics skips CCD and the
+second contact build. The first build still checks public geometry/filter edits;
+events, position/joint processing and simulation time continue normally.
+`StepStatistics::stationary_steps` identifies this path (0 or 1 per step).
+
+Local Release / single-thread measurements use the same copied
+[TomCat dev_butter adapter](https://github.com/chnnasn/TomCat_Engine/tree/dev_butter),
+60 warm-up steps and 300 measured steps at 1/60 s. Old/new order alternates across
+six rounds; discard round zero and take the median of five. These compare Butter
+against Butter `52f15a5`, not a new Box2D measurement or an updated TomCat dependency.
+
+| Scene | Bodies | `52f15a5` ms/step | Follow-up ms/step |
+| --- | ---: | ---: | ---: |
+| Separated | 100 | 0.0197273 | 0.0189310 |
+| Separated | 500 | 0.0982030 | 0.1021520 |
+| Separated | 1,000 | 0.220181 | 0.215525 |
+| Circles | 100 | 0.0437580 | 0.0285767 |
+| Circles | 500 | 0.490423 | 0.360655 |
+| Circles | 1,000 | 1.38200 | 1.15538 |
+| Boxes | 100 | 0.0985077 | 0.0736893 |
+| Boxes | 500 | 6.10559 | 5.46762 |
+| Boxes | 1,000 | 13.4382 | 12.1737 |
+
+Separated timings differ by about ±4%; treat them as comparable. The 1,000-body
+circle/box workloads use about 16%/9% less time. See the
+[108 raw samples](benchmarks/contact-followup-20260921.csv); `baseline52` is the
+old build and `retest` is this follow-up. All samples advance five measured seconds
+and report zero CCD failures, nonfinite coordinates or below-ground centers.
+
+Separate diagnostic runs hash the float bits of position, angle, linear/angular
+velocity and awake state after every step, including warm-up. All nine scenes
+match the baseline hashes and active-body-step counts. For circles those counts
+are 4,100 / 39,000 / 131,000; for boxes 7,800 / 180,000 / 360,000. Thus the measured
+gain does not come from earlier sleeping. At six seconds, 500/1,000 boxes are
+still awake. The stricter native 60-second tests retain first full sleep at
+9.56667/12.1667 seconds, and check floor geometry and CCD diagnostics throughout.
+
+Reproduction: build Release, run all CTest tests (including thin-wall CCD,
+long-rest stability and public-edit wake regressions), then run
+`test_2d_tomcat_stack 500 boxes 3600` and `test_2d_tomcat_stack 1000 boxes 3600`.
+Local adapter binaries are `build/tomcat-retest/bin/Release/{baseline52,retest}`;
+arguments are body count, scenario (0 separated / 1 circles / 2 boxes), repetitions.
+Timing, per-step hash and long-run logs are under `build/contact-followup*`.

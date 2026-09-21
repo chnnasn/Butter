@@ -2,8 +2,10 @@
 
 #include "butter/math/vec2.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <variant>
 #include <utility>
 #include <vector>
@@ -74,6 +76,42 @@ inline Vec2 center_of(const Shape& shape, const Transform& t) {
     return t.position;
 }
 
+namespace shape_detail {
+// Most convex fixtures have only a few vertices. Keep their temporary world
+// geometry on the stack, with an unrestricted fallback for larger polygons.
+class WorldVertices {
+    std::array<Vec2, 16> local_;
+    std::vector<Vec2> overflow_;
+    std::size_t size_{};
+public:
+    WorldVertices(const Shape& shape, const Transform& t) {
+        if (const auto* box = std::get_if<Box>(&shape)) {
+            size_ = 4;
+            local_[0] = {-box->half_extents.x, -box->half_extents.y};
+            local_[1] = { box->half_extents.x, -box->half_extents.y};
+            local_[2] = { box->half_extents.x,  box->half_extents.y};
+            local_[3] = {-box->half_extents.x,  box->half_extents.y};
+        } else if (const auto* polygon = std::get_if<Polygon>(&shape)) {
+            size_ = polygon->vertices.size();
+            if (size_ <= local_.size())
+                std::copy(polygon->vertices.begin(), polygon->vertices.end(), local_.begin());
+            else
+                overflow_ = polygon->vertices;
+        } else if (std::holds_alternative<Capsule>(shape)) {
+            overflow_ = world_vertices(shape, t);
+            size_ = overflow_.size();
+            return;
+        }
+        auto* data = size_ <= local_.size() ? local_.data() : overflow_.data();
+        for (std::size_t i = 0; i < size_; ++i)
+            data[i] = t.position + rotate(data[i], t.angle);
+    }
+    std::span<const Vec2> view() const {
+        return {size_ <= local_.size() ? local_.data() : overflow_.data(), size_};
+    }
+};
+} // namespace shape_detail
+
 inline AABB compute_aabb(const Shape& shape, const Transform& t) {
     if (const auto* circle = std::get_if<Circle>(&shape)) {
         const Vec2 r{circle->radius, circle->radius}; return {t.position - r, t.position + r};
@@ -121,7 +159,8 @@ inline bool circle_circle(const Circle& a, const Transform& ta, const Circle& b,
 
 inline bool circle_polygon(const Circle& circle, const Transform& tc, const Shape& polygon,
                            const Transform& tp, Contact& c) {
-    const auto vertices = world_vertices(polygon, tp);
+    const shape_detail::WorldVertices storage(polygon, tp);
+    const auto vertices = storage.view();
     if (vertices.size() < 3) return false;
     float best_dist2 = std::numeric_limits<float>::max(); Vec2 closest{};
     for (std::size_t i = 0; i < vertices.size(); ++i) {
@@ -170,15 +209,16 @@ inline bool capsule_circle(const Capsule& capsule, const Transform& tc, const Ci
 
 inline bool polygon_polygon(const Shape& sa, const Transform& ta, const Shape& sb,
                             const Transform& tb, Contact& c) {
-    const auto va = world_vertices(sa, ta), vb = world_vertices(sb, tb);
+    const shape_detail::WorldVertices storage_a(sa, ta), storage_b(sb, tb);
+    const auto va = storage_a.view(), vb = storage_b.view();
     if (va.size() < 3 || vb.size() < 3) return false;
     float best = std::numeric_limits<float>::max(); Vec2 best_axis{};
     const Vec2 delta = center_of(sb, tb) - center_of(sa, ta);
-    auto project = [](const std::vector<Vec2>& v, Vec2 axis, float& lo, float& hi) {
+    auto project = [](std::span<const Vec2> v, Vec2 axis, float& lo, float& hi) {
         lo = hi = v[0].dot(axis);
         for (const auto& p : v) { const float d = p.dot(axis); lo = std::min(lo, d); hi = std::max(hi, d); }
     };
-    auto axes_from = [&](const std::vector<Vec2>& v) {
+    auto axes_from = [&](std::span<const Vec2> v) {
         for (std::size_t i = 0; i < v.size(); ++i) {
             const Vec2 edge = v[(i + 1) % v.size()] - v[i];
             Vec2 axis{-edge.y, edge.x}; axis.normalize();
@@ -226,11 +266,12 @@ inline Manifold contact_manifold(const Shape& a, const Transform& ta, const Shap
                                  const Transform& tb, Vec2 normal, Vec2 fallback,
                                  float separation, float margin = 0.002f) {
     Manifold m; m.normal = normal;
-    const auto va = world_vertices(a, ta), vb = world_vertices(b, tb);
+    const shape_detail::WorldVertices storage_a(a, ta), storage_b(b, tb);
+    const auto va = storage_a.view(), vb = storage_b.view();
     if (va.size() < 3 || vb.size() < 3) {
         m.points[0] = {fallback, separation, 0}; m.count = 1; return m;
     }
-    auto face = [](const std::vector<Vec2> &v, Vec2 n) {
+    auto face = [](std::span<const Vec2> v, Vec2 n) {
         int best = 0;
         float alignment = -2;
         Vec2 center{};

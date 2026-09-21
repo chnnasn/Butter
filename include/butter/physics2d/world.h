@@ -234,6 +234,7 @@ class World {
         std::size_t position_corrections{}, projection_candidates{}, projection_sweeps{};
         std::size_t cached_manifolds{}, sleeping_contacts{}, active_constraints{};
         std::size_t awake_bodies{}, sleep_groups{}, moving_groups{}, settling_groups{};
+        std::size_t stationary_steps{};
         float max_speed{}, max_angular_speed{}, max_penetration{}, max_correction{};
     };
     struct ContactDiagnostic {
@@ -389,11 +390,25 @@ class World {
         // Resting contacts absorb gravity before CCD sees them as new impacts.
         build_constraints(dt, true);
         solve_velocities();
-        auto ccd_start = Clock::now();
-        step_continuous(dt);
-        step_statistics_.ccd_ms += milliseconds(ccd_start);
-        build_constraints(dt, false);
-        solve_velocities();
+        // The first detection still validates public edits and filtering every
+        // step. With no awake dynamics or moving kinematics, no geometry can
+        // change during integration: retain its constraints and event candidates.
+        bool stationary = std::all_of(bodies_.begin(), bodies_.end(), [](const auto &b) {
+            return (b->type != BodyType::Dynamic || b->sleeping) &&
+                   (b->type != BodyType::Kinematic ||
+                    (b->velocity.length_squared() == 0 && b->angular_velocity == 0));
+        });
+        if (stationary) {
+            ccd_statistics_ = {};
+            ccd_statistics_.advanced_time = dt;
+            ++step_statistics_.stationary_steps;
+        } else {
+            auto ccd_start = Clock::now();
+            step_continuous(dt);
+            step_statistics_.ccd_ms += milliseconds(ccd_start);
+            build_constraints(dt, false);
+            solve_velocities();
+        }
         auto event_start = Clock::now();
         const auto &pairs = candidate_pairs(false);
         broadphase_candidate_count_ = pairs.size();
@@ -690,6 +705,13 @@ class World {
     std::map<ContactKey, CachedContact> contact_cache_;
     std::vector<Constraint> constraints_;
     std::vector<std::size_t> active_constraints_;
+    struct VelocityGeometry {
+        Vec2 ra[2], rb[2], tangent;
+        float normal_mass[2]{}, tangent_mass[2]{};
+        float k01{}, determinant{};
+        bool movable{};
+    };
+    std::vector<VelocityGeometry> velocity_geometry_;
     std::vector<ContactKey> solid_contacts_;
     struct ProjectionObstacle {
         Body *body;
@@ -791,14 +813,14 @@ class World {
             return changed || !enabled;
         });
     }
-    const Constraint *sleeping_cache(const Fixture &a, const Fixture &b) const {
+    const Constraint *sleeping_cache(const Fixture &a, const Fixture &b,
+                                    const CachedContact *cached) const {
         if (a.body->is_dynamic() || b.body->is_dynamic() || a.body->type == BodyType::Kinematic ||
             b.body->type == BodyType::Kinematic)
             return nullptr;
-        auto it = contact_cache_.find(contact_key(a, b));
-        if (it == contact_cache_.end())
+        if (!cached)
             return nullptr;
-        auto &old = it->second;
+        const auto &old = *cached;
         // Bodies and shapes are publicly writable: exact snapshots invalidate
         // the sleep shortcut after teleports, geometry edits or fixture offsets.
         if (!same_transform(a.body->transform, old.transform_a) ||
@@ -809,11 +831,11 @@ class World {
             return nullptr;
         return &old.c;
     }
-    const Constraint *geometry_cache(const Fixture &a, const Fixture &b) const {
-        auto it = contact_cache_.find(contact_key(a, b));
-        if (it == contact_cache_.end())
+    const Constraint *geometry_cache(const Fixture &a, const Fixture &b,
+                                    const CachedContact *cached) const {
+        if (!cached)
             return nullptr;
-        const auto &old = it->second;
+        const auto &old = *cached;
         // Exact detection snapshots only: position correction, integration,
         // public geometry edits and fixture offset changes invalidate reuse.
         if (!same_transform(a.body->transform, old.c.detected_a) ||
@@ -844,7 +866,9 @@ class World {
             visit_pairs(*bodies_[i], *bodies_[j], [&](Fixture &fa, Fixture &fb) {
                 if (!allowed(fa, fb) || fa.trigger || fb.trigger)
                     return;
-                if (auto cached = sleeping_cache(fa, fb)) {
+                auto old = contact_cache_.find(contact_key(fa, fb));
+                const auto *previous_contact = old == contact_cache_.end() ? nullptr : &old->second;
+                if (auto cached = sleeping_cache(fa, fb, previous_contact)) {
                     constraints_.push_back(*cached);
                     constraints_.back().friction =
                         std::sqrt(std::max(0.0f, fa.material.friction * fb.material.friction));
@@ -855,7 +879,7 @@ class World {
                 }
                 Contact contact;
                 auto ta = fixture_transform(fa), tb = fixture_transform(fb);
-                const auto *geometry = geometry_cache(fa, fb);
+                const auto *geometry = geometry_cache(fa, fb, previous_contact);
                 bool touching;
                 if (geometry) {
                     contact = geometry->contact;
@@ -920,7 +944,6 @@ class World {
                                                          fb.restitution_threshold))
                             ? -std::max(fa.material.restitution, fb.material.restitution) * speed
                             : 0;
-                    auto old = contact_cache_.find(c.key);
                     if (old != contact_cache_.end() && old->second.c.normal.dot(c.normal) > 0.95f) {
                         for (int n = 0; n < old->second.c.count; ++n) {
                             auto &prev = old->second.c.points[n];
@@ -972,24 +995,41 @@ class World {
     }
     void solve_velocities() {
         auto start = Clock::now();
+        // Transforms and mass properties are constant throughout this velocity pass.
+        // Rebuild after integration; never reuse these values for position corrections.
+        velocity_geometry_.resize(active_constraints_.size());
+        for (std::size_t j = 0; j < active_constraints_.size(); ++j) {
+            auto &c = constraints_[active_constraints_[j]];
+            auto &g = velocity_geometry_[j];
+            float ma = inv_mass(*c.a), mb = inv_mass(*c.b), ia = inv_inertia(*c.a),
+                  ib = inv_inertia(*c.b);
+            g.movable = ma + mb > 0;
+            g.tangent = {-c.normal.y, c.normal.x};
+            for (int k = 0; k < c.count; ++k) {
+                g.ra[k] = rotate(c.points[k].local_a, c.a->transform.angle);
+                g.rb[k] = rotate(c.points[k].local_b, c.b->transform.angle);
+                float na = g.ra[k].cross(c.normal), nb = g.rb[k].cross(c.normal),
+                      sa = g.ra[k].cross(g.tangent), sb = g.rb[k].cross(g.tangent);
+                g.normal_mass[k] = ma + mb + ia * na * na + ib * nb * nb;
+                g.tangent_mass[k] = ma + mb + ia * sa * sa + ib * sb * sb;
+            }
+            if (c.count == 2) {
+                float a0 = g.ra[0].cross(c.normal), a1 = g.ra[1].cross(c.normal),
+                      b0 = g.rb[0].cross(c.normal), b1 = g.rb[1].cross(c.normal);
+                g.k01 = ma + mb + ia * a0 * a1 + ib * b0 * b1;
+                g.determinant = g.normal_mass[0] * g.normal_mass[1] - g.k01 * g.k01;
+            }
+        }
         for (int iteration = 0; iteration < config_.solver_iterations; ++iteration)
-            for (auto i : active_constraints_) {
-                auto &c = constraints_[i];
-                float ma = inv_mass(*c.a), mb = inv_mass(*c.b), ia = inv_inertia(*c.a),
-                      ib = inv_inertia(*c.b);
-                if (ma + mb <= 0)
+            for (std::size_t j = 0; j < active_constraints_.size(); ++j) {
+                auto &c = constraints_[active_constraints_[j]];
+                const auto &g = velocity_geometry_[j];
+                if (!g.movable)
                     continue;
                 if (c.count == 2) {
-                    Vec2 ra0 = rotate(c.points[0].local_a, c.a->transform.angle),
-                         rb0 = rotate(c.points[0].local_b, c.b->transform.angle);
-                    Vec2 ra1 = rotate(c.points[1].local_a, c.a->transform.angle),
-                         rb1 = rotate(c.points[1].local_b, c.b->transform.angle);
-                    float a0 = ra0.cross(c.normal), a1 = ra1.cross(c.normal),
-                          b0 = rb0.cross(c.normal), b1 = rb1.cross(c.normal);
-                    float k00 = ma + mb + ia * a0 * a0 + ib * b0 * b0,
-                          k11 = ma + mb + ia * a1 * a1 + ib * b1 * b1,
-                          k01 = ma + mb + ia * a0 * a1 + ib * b0 * b1;
-                    float det = k00 * k11 - k01 * k01;
+                    Vec2 ra0 = g.ra[0], rb0 = g.rb[0], ra1 = g.ra[1], rb1 = g.rb[1];
+                    float k00 = g.normal_mass[0], k11 = g.normal_mass[1], k01 = g.k01;
+                    float det = g.determinant;
                     if (det > 1e-8f) {
                         float v0 =
                             c.points[0].target -
@@ -1009,22 +1049,19 @@ class World {
                 }
                 for (int k = 0; k < c.count; ++k) {
                     auto &p = c.points[k];
-                    Vec2 ra = rotate(p.local_a, c.a->transform.angle),
-                         rb = rotate(p.local_b, c.b->transform.angle);
+                    Vec2 ra = g.ra[k], rb = g.rb[k];
                     Vec2 rv = point_velocity(*c.b, rb) - point_velocity(*c.a, ra);
-                    float na = ra.cross(c.normal), nb = rb.cross(c.normal),
-                          denom = ma + mb + ia * na * na + ib * nb * nb;
+                    float denom = g.normal_mass[k];
                     float previous = p.normal_impulse;
                     p.normal_impulse =
                         std::max(0.0f, previous + (p.target - rv.dot(c.normal)) / denom);
                     apply(c, ra, rb, c.normal * (p.normal_impulse - previous));
-                    Vec2 tangent{-c.normal.y, c.normal.x};
-                    float sa = ra.cross(tangent), sb = rb.cross(tangent);
+                    Vec2 tangent = g.tangent;
                     rv = point_velocity(*c.b, rb) - point_velocity(*c.a, ra);
                     previous = p.tangent_impulse;
                     float limit = c.friction * p.normal_impulse;
                     p.tangent_impulse = std::clamp(
-                        previous - rv.dot(tangent) / (ma + mb + ia * sa * sa + ib * sb * sb),
+                        previous - rv.dot(tangent) / g.tangent_mass[k],
                         -limit, limit);
                     apply(c, ra, rb, tangent * (p.tangent_impulse - previous));
                 }

@@ -8,6 +8,28 @@ static void require(bool condition, const char *message) {
         throw std::runtime_error(message);
 }
 int main() try {
+    // Stack storage and the unbounded fallback must preserve the public vertex
+    // conversion, including empty/degenerate polygons and capsule fallback.
+    {
+        std::vector<Shape> shapes{Box{{.7f, .3f}}, Capsule{.2f, .6f}, Circle{.3f}};
+        for (int n : {0, 1, 3, 16, 17, 64}) {
+            Polygon p;
+            for (int i = 0; i < n; ++i) {
+                float angle = 6.2831853f * i / n;
+                p.vertices.push_back({std::cos(angle), std::sin(angle)});
+            }
+            shapes.push_back(p);
+        }
+        for (const auto &shape : shapes) {
+            Transform transform{{2.3f, -4.1f}, .731f};
+            const auto expected = world_vertices(shape, transform);
+            const shape_detail::WorldVertices storage(shape, transform);
+            const auto actual = storage.view();
+            require(actual.size() == expected.size() &&
+                        std::equal(actual.begin(), actual.end(), expected.begin()),
+                    "temporary vertex storage changed geometry");
+        }
+    }
     {
         World::Config cfg;
         cfg.gravity = {};
@@ -109,7 +131,8 @@ int main() try {
         require(box.sleeping && reused > 0, "resting geometry did not reuse its manifold");
         w.step();
         require(w.step_statistics().active_constraints == 0 &&
-                    w.step_statistics().position_corrections == 0,
+                    w.step_statistics().position_corrections == 0 &&
+                    w.step_statistics().stationary_steps == 1,
                 "sleeping group still solved constraints");
         switch (mutation) {
         case 0:
@@ -139,10 +162,33 @@ int main() try {
         }
         w.step();
         require(!box.sleeping, "public edit or force failed to wake supported body");
+        require(w.step_statistics().stationary_steps == 0,
+                "woken body incorrectly used stationary world path");
         if (mutation == 0)
             require(box.velocity.x > 0, "force applied to sleeping body was lost");
         else
             require(box.velocity.y < 0, "invalidated support prevented gravity");
+    }
+
+    {
+        World w;
+        auto &body = w.create_empty_body();
+        body.type = BodyType::Kinematic;
+        w.step();
+        require(w.step_statistics().stationary_steps == 1,
+                "stationary kinematic prevented resting path");
+        body.velocity = {60, 0};
+        w.step();
+        require(std::abs(body.transform.position.x - 1) < 1e-5f &&
+                    w.step_statistics().stationary_steps == 0,
+                "moving kinematic skipped integration");
+        body.velocity = {};
+        body.angular_velocity = 60;
+        w.step();
+        require(std::abs(body.transform.angle - 1) < 1e-5f,
+                "rotating kinematic skipped integration");
+        require(std::abs(w.simulation_time() - 3.0 / 60) < 1e-7,
+                "resting path discarded simulation time");
     }
 
     // A tall sparse bullet layout exercises the coupled CCD path. Its sweep
