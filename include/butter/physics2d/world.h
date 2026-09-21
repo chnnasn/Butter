@@ -232,6 +232,7 @@ class World {
         std::size_t constraints{}, warm_started_points{}, position_clamps{};
         double sleeping_ms{}, cache_ms{};
         std::size_t position_corrections{}, projection_candidates{}, projection_sweeps{};
+        std::size_t projection_fast_rejections{};
         std::size_t cached_manifolds{}, sleeping_contacts{}, active_constraints{};
         std::size_t awake_bodies{}, sleep_groups{}, moving_groups{}, settling_groups{};
         std::size_t stationary_steps{};
@@ -685,6 +686,7 @@ class World {
         Body *a{}, *b{};
         Vec2 normal{};
         float friction{};
+        float projection_radius_a{}, projection_radius_b{};
         int count{};
         ConstraintPoint points[2]{};
         const Shape *shape_a{}, *shape_b{};
@@ -866,10 +868,28 @@ class World {
             visit_pairs(*bodies_[i], *bodies_[j], [&](Fixture &fa, Fixture &fb) {
                 if (!allowed(fa, fb) || fa.trigger || fb.trigger)
                     return;
+                auto remember = [&](Constraint c) {
+                    auto radius = [&](std::size_t index) {
+                        const auto &bounds = pair_bounds_[index];
+                        auto center = bodies_[index]->transform.position;
+                        Vec2 reach{std::max(std::abs(bounds.min.x - center.x),
+                                            std::abs(bounds.max.x - center.x)),
+                                   std::max(std::abs(bounds.min.y - center.y),
+                                            std::abs(bounds.max.y - center.y))};
+                        // The full body's expanded AABB includes every fixture.
+                        // Its corner radius encloses any subsequent rotation.
+                        return reach.length() * 1.001f + 0.001f;
+                    };
+                    // Sleeping contacts do not need bounds work. If island
+                    // propagation wakes them below, -1 uses the full guard.
+                    c.projection_radius_a = config_.ccd.enabled && c.a->is_dynamic() ? radius(i) : -1;
+                    c.projection_radius_b = config_.ccd.enabled && c.b->is_dynamic() ? radius(j) : -1;
+                    constraints_.push_back(c);
+                };
                 auto old = contact_cache_.find(contact_key(fa, fb));
                 const auto *previous_contact = old == contact_cache_.end() ? nullptr : &old->second;
                 if (auto cached = sleeping_cache(fa, fb, previous_contact)) {
-                    constraints_.push_back(*cached);
+                    remember(*cached);
                     constraints_.back().friction =
                         std::sqrt(std::max(0.0f, fa.material.friction * fb.material.friction));
                     if (cached->event_contact)
@@ -961,7 +981,7 @@ class World {
                     }
                 }
                 if (c.count)
-                    constraints_.push_back(c);
+                    remember(c);
             });
         auto wake_start = Clock::now();
         wake_connected();
@@ -1068,13 +1088,35 @@ class World {
             }
         step_statistics_.velocity_ms += milliseconds(start);
     }
-    void guard_projection(Body &body, Transform before) {
+    void guard_projection(Body &body, Transform before, float radius = -1) {
         if (!config_.ccd.enabled || !body.is_dynamic())
             return;
         const auto after = body.transform;
         if ((after.position - before.position).length_squared() < 1e-16f &&
             std::abs(after.angle - before.angle) < 1e-8f)
             return;
+        if (radius >= 0) {
+            // Cheap full-rotation envelope first. Most stack corrections are
+            // far from static geometry; avoid rebuilding their fixture AABBs.
+            // A hit here still goes through the tighter bounds and exact sweep.
+            AABB sweep{{std::min(before.position.x, after.position.x) - radius,
+                        std::min(before.position.y, after.position.y) - radius},
+                       {std::max(before.position.x, after.position.x) + radius,
+                        std::max(before.position.y, after.position.y) + radius}};
+            bool candidate = false;
+            for (const auto &entry : projection_obstacles_) {
+                if (entry.bounds.min.x > sweep.max.x)
+                    break;
+                if (sweep.overlaps(entry.bounds)) {
+                    candidate = true;
+                    break;
+                }
+            }
+            if (!candidate) {
+                ++step_statistics_.projection_fast_rejections;
+                return;
+            }
+        }
         float fraction = 1;
         // Bound the full correction path, not just its endpoints. Every point
         // rotates by at most radius * angle; the endpoint AABB bounds radius
@@ -1158,8 +1200,8 @@ class World {
             c.a->transform.angle -= na * impulse * ia;
             c.b->transform.position += c.normal * (impulse * mb);
             c.b->transform.angle += nb * impulse * ib;
-            guard_projection(*c.a, before_a);
-            guard_projection(*c.b, before_b);
+            guard_projection(*c.a, before_a, c.projection_radius_a);
+            guard_projection(*c.b, before_b, c.projection_radius_b);
             if (on_contact_diagnostic)
                 on_contact_diagnostic({c.a, c.b, c.a->velocity, c.b->velocity, c.normal,
                                        -separation, before_a, before_b, c.a->transform,

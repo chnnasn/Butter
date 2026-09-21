@@ -42,6 +42,20 @@ static Body &shot(World &w, float x = -5, float velocity = 600, float restitutio
 }
 int main() try {
     {
+        // Exercise the heap fallback as well as small on-stack CCD geometry.
+        for (int vertices : {4, 16, 17, 64}) {
+            Polygon polygon;
+            for (int i = 0; i < vertices; ++i) {
+                float angle = 6.2831853f * i / vertices;
+                polygon.vertices.push_back({std::cos(angle), std::sin(angle)});
+            }
+            auto hit = sweep_shapes(Shape{polygon}, {{{-5, 0}, 0}, {{5, 0}, 0}},
+                                    Shape{Box{{.01f, 5}}}, {{{0, 0}, 0}, {{0, 0}, 0}});
+            check(hit && hit->converged && hit->fraction > .398f && hit->fraction < .400f,
+                  "convex CCD temporary storage missed thin wall");
+        }
+    }
+    {
         // Long ground faces must not introduce a tangential normal component.
         for (int i = 0; i < 50; ++i) {
             float x = float(i) * .65f - 16;
@@ -397,6 +411,27 @@ int main() try {
               "contact position correction crossed floor outside original pairs");
         check(small.angular_velocity == 0 && upper.angular_velocity == 0,
               "fixed rotation changed during contact solving");
+    }
+    {
+        // A correction at the upper fixture must also protect a distant foot.
+        // The projection envelope must include the full compound body, not
+        // just the fixture that generated this contact constraint.
+        World w(config());
+        w.create_body().static_body().at(0, -.005f).box(2, .005f).build();
+        auto &small = w.create_empty_body();
+        small.transform.position = {0, 1.05f};
+        Fixture f;
+        f.shape = Box{{.02f, .02f}};
+        w.add_fixture(small, f);
+        f.local.position.y = -1;
+        w.add_fixture(small, f);
+        auto &upper = w.create_body().at(0, 1.5f).box(.5f, .5f).mass(1000).build();
+        small.fixed_rotation = upper.fixed_rotation = true;
+        w.step();
+        check(small.transform.position.y >= 1.019f,
+              "compound contact correction pushed offset foot through floor");
+        check(w.step_statistics().position_clamps > 0,
+              "compound projection failed to exercise CCD guard");
     }
     {
         // Sleep-cache snapshots must notice direct public geometry edits, even

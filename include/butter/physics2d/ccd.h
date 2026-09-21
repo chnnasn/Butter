@@ -64,14 +64,16 @@ inline float radius(const Shape &s) {
     if (auto *box = std::get_if<Box>(&s))
         return box->half_extents.length();
     float result = 0;
-    for (auto v : world_vertices(s, {}))
+    const shape_detail::WorldVertices vertices(s, {});
+    for (auto v : vertices.view())
         result = std::max(result, v.length());
     return result;
 }
 inline Vec2 support(const Shape &s, const Transform &t, Vec2 axis) {
     if (auto *c = std::get_if<Circle>(&s))
         return t.position + axis * c->radius;
-    const auto vertices = world_vertices(s, t);
+    const shape_detail::WorldVertices storage(s, t);
+    const auto vertices = storage.view();
     float best = -std::numeric_limits<float>::infinity();
     Vec2 point = t.position;
     for (auto v : vertices)
@@ -88,9 +90,10 @@ struct Separation {
 inline Separation separation(const Shape &a, const Transform &ta, const Shape &b,
                              const Transform &tb) {
     Separation result;
-    const auto va = world_vertices(a, ta), vb = world_vertices(b, tb);
+    const shape_detail::WorldVertices storage_a(a, ta), storage_b(b, tb);
+    const auto va = storage_a.view(), vb = storage_b.view();
     auto cached_support = [](const Shape &shape, const Transform &t,
-                             const std::vector<Vec2> &vertices, Vec2 n) {
+                             std::span<const Vec2> vertices, Vec2 n) {
         if (auto *circle = std::get_if<Circle>(&shape))
             return t.position + n * circle->radius;
         float best = -std::numeric_limits<float>::infinity();
@@ -113,7 +116,7 @@ inline Separation separation(const Shape &a, const Transform &ta, const Shape &b
                 result = {gap, n, (pa + pb) * 0.5f};
         }
     };
-    auto faces = [&](const std::vector<Vec2> &vertices) {
+    auto faces = [&](std::span<const Vec2> vertices) {
         for (std::size_t i = 0; i < vertices.size(); ++i) {
             Vec2 edge = vertices[(i + 1) % vertices.size()] - vertices[i];
             axis_test({-edge.y, edge.x});
@@ -133,7 +136,7 @@ inline Separation separation(const Shape &a, const Transform &ta, const Shape &b
     if (!std::isfinite(result.distance))
         axis_test({1, 0});
     const Vec2 tangent{-result.normal.y, result.normal.x};
-    auto feature = [&](const Shape &shape, const Transform &t, const std::vector<Vec2> &vertices,
+    auto feature = [&](const Shape &shape, const Transform &t, std::span<const Vec2> vertices,
                        Vec2 n) {
         Vec2 p = cached_support(shape, t, vertices, n);
         float lo = std::numeric_limits<float>::infinity(), hi = -lo;
@@ -199,7 +202,8 @@ inline std::pair<double, double> projected_motion(const Shape &shape, const Shap
         lo -= circle->radius;
         hi += circle->radius;
     } else {
-        for (auto q : world_vertices(shape, sweep.local))
+        const shape_detail::WorldVertices vertices(shape, sweep.local);
+        for (auto q : vertices.view())
             vertex(q);
     }
     return {lo, hi};

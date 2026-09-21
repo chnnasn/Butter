@@ -195,3 +195,46 @@ long-rest stability and public-edit wake regressions), then run
 Local adapter binaries are `build/tomcat-retest/bin/Release/{baseline52,retest}`;
 arguments are body count, scenario (0 separated / 1 circles / 2 boxes), repetitions.
 Timing, per-step hash and long-run logs are under `build/contact-followup*`.
+
+## Position projection follow-up against `9baad05`
+
+CCD separation, support and projected-motion queries now also use the small
+vertex buffer, with the same heap fallback for large polygons. Contact position
+corrections first test a conservative radius envelope against static/kinematic
+obstacles. The radius comes from the entire body's fresh expanded AABB, including
+all fixture offsets, and bounds any rotation along the correction path. A possible
+hit still runs the original tighter AABB and exact CCD guard. Sleeping contacts
+skip radius preparation; a subsequent island wake uses the original guard.
+Joint corrections also retain that original path.
+
+The same six-round alternating adapter protocol, against `9baad05`:
+
+| Scene | Bodies | `9baad05` ms/step | Follow-up ms/step |
+| --- | ---: | ---: | ---: |
+| Separated | 100 | 0.0193140 | 0.0188880 |
+| Separated | 500 | 0.0993017 | 0.0985433 |
+| Separated | 1,000 | 0.212034 | 0.210657 |
+| Circles | 100 | 0.0261097 | 0.0273970 |
+| Circles | 500 | 0.356339 | 0.338405 |
+| Circles | 1,000 | 1.13945 | 1.03305 |
+| Boxes | 100 | 0.0685563 | 0.0597087 |
+| Boxes | 500 | 5.40594 | 4.08126 |
+| Boxes | 1,000 | 12.1663 | 9.20322 |
+
+The 500/1,000-box workloads use about 25%/24% less time; 1,000 circles use about
+9% less. The 100-circle workload increases by 1.29 microseconds (about 5%): this
+is a dense-contact improvement, not a universal speedup. Separated timings are
+comparable. These are local Butter-to-Butter results, not updated Box2D ratios.
+[108 raw samples](benchmarks/projection-followup-20260921.csv) identify the old
+binary as `baseline9` and the new binary as `retest`. All advance five measured
+seconds with zero CCD failures, nonfinite coordinates or below-ground centers.
+
+A separate native 1,000-box diagnostic reduced position work from about 4.03 to
+1.49 ms/step. It retained 4,159,957 corrections and 280,993 tight obstacle candidates;
+`projection_fast_rejections` counted 7,977,400 discarded body correction envelopes.
+Per-step state hashes and activity counts match `9baad05` across all nine scenes.
+The 500/1,000-box 60-second tests retain full sleep at 9.56667/12.1667 seconds.
+New regression cases cover an offset compound foot pushed toward a thin floor
+by contact at another fixture, and thin-wall CCD for 4/16/17/64-vertex polygons.
+Local timing, state and long-run logs are under `build/projection-followup*`;
+the final timing log is `build/projection-followup-final.txt`.

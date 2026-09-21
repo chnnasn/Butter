@@ -63,6 +63,7 @@ int main(int argc, char **argv) try {
     double ccd = 0, detect = 0, velocity = 0, position = 0;
     double total = 0, sleeping_ms = 0, cache_ms = 0, active_ms = 0, resting_ms = 0;
     std::size_t active_body_steps = 0, projection_candidates = 0, corrections = 0, cached = 0;
+    std::size_t projection_fast_rejections = 0;
     int active_frames = 0, resting_frames = 0, first_sleep = -1;
     for (int frame = 0; frame < frames; ++frame) {
         int active = 0;
@@ -95,6 +96,7 @@ int main(int argc, char **argv) try {
             budget += s.budget_exhaustions;
             limits += s.limited;
             auto &t = w.step_statistics();
+            projection_fast_rejections += t.projection_fast_rejections;
             ccd += t.ccd_ms;
             detect += t.detection_ms;
             velocity += t.velocity_ms;
@@ -144,6 +146,7 @@ int main(int argc, char **argv) try {
               << " resting_frames=" << resting_frames << " resting_ms=" << resting_ms
               << " first_sleep_seconds=" << first_sleep / 60.0 << " corrections=" << corrections
               << " projection_candidates=" << projection_candidates << " cached_contacts=" << cached
+              << " projection_fast_rejections=" << projection_fast_rejections
               << std::endl;
     require(std::abs(w.simulation_time() - frames / 60.0) < 1e-4, "world time lost");
     require(std::abs(probe.transform.position.x - (1000.0f + frames)) < .001f,
