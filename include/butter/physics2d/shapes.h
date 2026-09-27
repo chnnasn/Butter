@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <variant>
@@ -27,10 +29,25 @@ struct Transform {
     float angle{0};
 };
 
+// Cached sine/cosine pair. Evaluating std::cos/std::sin is by far the most
+// repeated transcendental work in the solver: a single narrow-phase test or a
+// single constraint point otherwise costs several calls. Hoisting one Rot per
+// shape/body and reusing it for every vertex keeps the trigonometry count
+// proportional to the number of transforms, not to the number of vertices.
+struct Rot {
+    float c{1}, s{0};
+    Rot() = default;
+    inline explicit Rot(float angle) : c(std::cos(angle)), s(std::sin(angle)) {}
+    inline Rot(float cosine, float sine) : c(cosine), s(sine) {}
+};
+
 inline Vec2 rotate(Vec2 v, float angle) {
     const float c = std::cos(angle), s = std::sin(angle);
     return {c * v.x - s * v.y, s * v.x + c * v.y};
 }
+
+inline Vec2 rotate(Vec2 v, Rot r) { return {r.c * v.x - r.s * v.y, r.s * v.x + r.c * v.y}; }
+inline Rot inverse(Rot r) { return {r.c, -r.s}; }
 
 struct Contact {
     Vec2 normal{}; // from A to B
@@ -62,18 +79,170 @@ inline std::vector<Vec2> world_vertices(const Shape& shape, const Transform& t) 
             result.push_back({capsule->radius * std::cos(a), -capsule->half_length - capsule->radius * std::sin(a)});
         }
     }
-    for (auto& v : result) v = t.position + rotate(v, t.angle);
+    const Rot rot(t.angle);
+    for (auto& v : result) v = t.position + rotate(v, rot);
     return result;
 }
 
 inline Vec2 center_of(const Shape& shape, const Transform& t) {
-    if (const auto* circle = std::get_if<Circle>(&shape)) (void)circle;
     if (const auto* polygon = std::get_if<Polygon>(&shape)) {
         Vec2 sum{};
         for (const auto& v : polygon->vertices) sum += v;
-        if (!polygon->vertices.empty()) return t.position + rotate(sum / float(polygon->vertices.size()), t.angle);
+        if (!polygon->vertices.empty())
+            return t.position + rotate(sum / float(polygon->vertices.size()), Rot(t.angle));
     }
     return t.position;
+}
+
+// ---------------------------------------------------------------------------
+// Shape signatures and mass properties
+// ---------------------------------------------------------------------------
+
+// Cheap, allocation-free content signature. Contact caches use it to notice
+// public edits to a shape without snapshotting (deep-copying) the geometry, and
+// without the O(n) vertex comparisons a structural equality needs.
+inline std::uint64_t shape_hash(const Shape& shape) {
+    std::uint64_t h = 1469598103934665603ull; // FNV-1a
+    auto mix = [&h](std::uint64_t value) {
+        h ^= value;
+        h *= 1099511628211ull;
+    };
+    auto mix_float = [&mix](float value) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        mix(bits);
+    };
+    auto mix_point = [&mix_float](Vec2 v) {
+        mix_float(v.x);
+        mix_float(v.y);
+    };
+    mix(shape.index());
+    if (const auto* circle = std::get_if<Circle>(&shape))
+        mix_float(circle->radius);
+    else if (const auto* box = std::get_if<Box>(&shape))
+        mix_point(box->half_extents);
+    else if (const auto* polygon = std::get_if<Polygon>(&shape)) {
+        mix(polygon->vertices.size());
+        for (auto v : polygon->vertices)
+            mix_point(v);
+    } else if (const auto* capsule = std::get_if<Capsule>(&shape)) {
+        mix_float(capsule->radius);
+        mix_float(capsule->half_length);
+    } else {
+        const auto& triangles = std::get<Mesh>(shape).triangles;
+        mix(triangles.size());
+        for (const auto& triangle : triangles) {
+            mix(triangle.vertices.size());
+            for (auto v : triangle.vertices)
+                mix_point(v);
+        }
+    }
+    return h;
+}
+
+// Mass, centroid and rotational inertia about the centroid, in local space.
+struct MassData {
+    float mass{};
+    Vec2 center{};
+    float inertia{};
+};
+
+inline MassData combine(const MassData& a, const MassData& b) {
+    const float mass = a.mass + b.mass;
+    if (mass <= 0)
+        return {};
+    MassData result;
+    result.mass = mass;
+    result.center = (a.center * a.mass + b.center * b.mass) / mass;
+    // Parallel axis theorem: shift each part's centroid inertia onto the
+    // combined centroid.
+    result.inertia = a.inertia + a.mass * (a.center - result.center).length_squared() +
+                     b.inertia + b.mass * (b.center - result.center).length_squared();
+    return result;
+}
+
+inline MassData transformed(const MassData& data, const Transform& local) {
+    MassData result = data;
+    result.center = local.position + rotate(data.center, Rot(local.angle));
+    return result;
+}
+
+inline MassData mass_data(const Shape& shape, float density) {
+    MassData result;
+    if (density <= 0)
+        return result;
+    if (const auto* circle = std::get_if<Circle>(&shape)) {
+        result.mass = density * 3.14159265358979f * circle->radius * circle->radius;
+        result.inertia = 0.5f * result.mass * circle->radius * circle->radius;
+        return result;
+    }
+    if (const auto* box = std::get_if<Box>(&shape)) {
+        const float hx = box->half_extents.x, hy = box->half_extents.y;
+        result.mass = density * 4.0f * hx * hy;
+        result.inertia = result.mass * (hx * hx + hy * hy) / 3.0f;
+        return result;
+    }
+    if (const auto* capsule = std::get_if<Capsule>(&shape)) {
+        const float r = capsule->radius, hl = capsule->half_length;
+        const float rect_mass = density * 4.0f * r * hl;
+        const float rect_inertia = rect_mass * (r * r + hl * hl) / 3.0f;
+        const float cap_mass = density * 3.14159265358979f * r * r;
+        const float cap_inertia = 0.5f * cap_mass * r * r;
+        result.mass = rect_mass + cap_mass;
+        result.inertia = rect_inertia + cap_inertia;
+        return result;
+    }
+    if (const auto* mesh = std::get_if<Mesh>(&shape)) {
+        for (const auto& triangle : mesh->triangles)
+            result = combine(result, mass_data(Shape{triangle}, density));
+        return result;
+    }
+    // Convex polygon: exact area/centroid/inertia integrals over the fan of
+    // signed triangles around the local origin, then shifted to the centroid.
+    const auto& vertices = std::get<Polygon>(shape).vertices;
+    if (vertices.size() < 3)
+        return result;
+    float area = 0, moment = 0;
+    Vec2 centroid{};
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        const Vec2 a = vertices[i], b = vertices[(i + 1) % vertices.size()];
+        const float cross = a.cross(b);
+        area += cross;
+        centroid += (a + b) * cross;
+        moment += cross * (a.dot(a) + a.dot(b) + b.dot(b));
+    }
+    area *= 0.5f;
+    if (std::abs(area) < 1.0e-12f)
+        return result; // Degenerate (collinear) outline carries no mass.
+    const float magnitude = std::abs(area);
+    result.center = centroid / (6.0f * area);
+    result.mass = density * magnitude;
+    result.inertia = density * magnitude * (moment / (12.0f * area)) - result.mass * result.center.length_squared();
+    if (result.inertia < 0)
+        result.inertia = 0;
+    return result;
+}
+
+// Distance from the local origin to the farthest point of the shape. Used for
+// conservative bounds (CCD) and motion thresholds.
+inline float shape_radius(const Shape& shape) {
+    if (const auto* circle = std::get_if<Circle>(&shape))
+        return circle->radius;
+    if (const auto* box = std::get_if<Box>(&shape))
+        return box->half_extents.length();
+    if (const auto* capsule = std::get_if<Capsule>(&shape))
+        return capsule->half_length + capsule->radius;
+    float result = 0;
+    auto consider = [&result](const std::vector<Vec2>& vertices) {
+        for (auto v : vertices)
+            result = std::max(result, v.length());
+    };
+    if (const auto* polygon = std::get_if<Polygon>(&shape))
+        consider(polygon->vertices);
+    else
+        for (const auto& triangle : std::get<Mesh>(shape).triangles)
+            consider(triangle.vertices);
+    return result;
 }
 
 namespace shape_detail {
@@ -102,9 +271,11 @@ public:
             size_ = overflow_.size();
             return;
         }
+        // One Rot for the whole outline instead of one trig pair per vertex.
+        const Rot rot(t.angle);
         auto* data = size_ <= local_.size() ? local_.data() : overflow_.data();
         for (std::size_t i = 0; i < size_; ++i)
-            data[i] = t.position + rotate(data[i], t.angle);
+            data[i] = t.position + rotate(data[i], rot);
     }
     std::span<const Vec2> view() const {
         return {size_ <= local_.size() ? local_.data() : overflow_.data(), size_};
@@ -134,10 +305,11 @@ inline AABB compute_aabb(const Shape& shape, const Transform& t) {
     // Polygon bounds do not need an allocated world-space vertex array.
     const auto& vertices = std::get<Polygon>(shape).vertices;
     if (vertices.empty()) return {t.position, t.position};
-    const Vec2 first = t.position + rotate(vertices[0], t.angle);
+    const Rot rot(t.angle);
+    const Vec2 first = t.position + rotate(vertices[0], rot);
     AABB result{first, first};
     for (const auto& local : vertices) {
-        const Vec2 v = t.position + rotate(local, t.angle);
+        const Vec2 v = t.position + rotate(local, rot);
         result.min.x = std::min(result.min.x, v.x); result.min.y = std::min(result.min.y, v.y);
         result.max.x = std::max(result.max.x, v.x); result.max.y = std::max(result.max.y, v.y);
     }

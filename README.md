@@ -76,7 +76,10 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_2d_stability` | Large landings, long resting stacks and connected wake/sleep |
 | `test_2d_tomcat_stack` | Original TomCat box parameters, time advancement and floor checks |
 | `test_2d_tomcat_circles` | 1,000-circle TomCat regression (runs `test_2d_tomcat_stack 1000 circles`) |
-| `test_2d_optimization` | Broadphase oracle, cache invalidation, sleeping-world fast path, kinematic motion and vertex/CCD buffers |
+| `test_2d_optimization` | Broadphase oracle, cache invalidation, sleeping-world fast path, kinematic motion, solver islands and vertex/CCD buffers |
+| `test_2d_mass` | Analytic circle/box/polygon mass, centroid and inertia, fixture transforms |
+| `test_2d_broadphase` | Dynamic-tree proxy moves, removals, AABB queries, ray casts and recompute validation |
+| `test_2d_joints` | Revolute anchors, lever arms, load, motor torque cap, angular limits and distance regression |
 
 Run all tests:
 
@@ -163,10 +166,9 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Revision `a8e4336` passes all 17 CTest cases (16 binaries) in
-both Release and Debug. These are repository regressions,
-separate from the external benchmark below. On Windows, inspect
-the PBD crate stack and explosion demo with:
+The suite is 20 CTest cases (19 binaries) and passes in both Release and Debug.
+These are repository regressions, separate from the external benchmark below. On
+Windows, inspect the PBD crate stack and explosion demo with:
 
 ```powershell
 cmake --build build --config Release --target exploding_crates
@@ -192,10 +194,10 @@ for (int i = 0; i < 120; ++i) world.step();
 ```
 
 The 2D module includes circle, box, capsule, convex polygon and indexed
-triangle mesh narrow phase, spatial-grid broadphase, PBD/impulse projection,
-friction, angular motion, sleeping, collision filtering, enter/exit triggers,
-raycast/AABB queries, distance constraints and a `physics2d_playground`
-example. `bench_2d [count] [circles|boxes] [awake]` checks landing correctness and
+triangle mesh narrow phase, a dynamic AABB-tree broadphase, PBD/impulse
+projection, friction, angular motion, sleeping, collision filtering, enter/exit
+triggers, raycast/AABB queries, distance and revolute constraints and a
+`physics2d_playground` example. `bench_2d [count] [circles|boxes] [awake]` checks landing correctness and
 reports active and sleeping costs separately; `awake` explicitly keeps bodies
 active for comparisons. This internal landing benchmark differs from the TomCat
 stack benchmark below. A dedicated internal mesh BVH remains a future optimization. The 2D module now
@@ -224,10 +226,33 @@ must keep inverse mass/inertia consistent. Fixture density is metadata: mass and
 inertia for explicit compound bodies are supplied by the engine integration.
 
 Distance joints support rotated local anchors and `collide_connected`; soft
-joints use `spring_stiffness` and `damping`. Deep penetration correction is bounded
-by `Config::max_position_correction`. Ray queries test circles and convex polygons
+joints use `spring_stiffness` and `damping`. Hinges are true revolute
+constraints: `add_hinge_joint(a, b, anchor_a, anchor_b)` takes per-body local
+anchors and `add_hinge_joint_at(a, b, world_point)` pins both bodies to one
+shared world point. A hinge exposes `motor(speed, max_torque)` and
+`limit(lower, upper)` (or `no_limit()`); motor and limit impulses are
+warm-started, and are dropped when the feature is switched off so a disabled
+motor cannot keep pulling. Deep penetration correction is bounded by
+`Config::max_position_correction`. Ray queries test circles and convex polygons
 (including rotated boxes) rather than their AABBs, and ignore origins inside them.
 See the 2D CCD section below for supported shapes and remaining boundaries.
+
+### 2D broadphase and solver islands
+
+The 2D world uses a dynamic AABB tree rather than a uniform grid. Proxies carry
+a fat AABB, so a body only reinserts once it moves past the margin; the same
+tree backs ray casts and AABB queries. `Config::broadphase_fat_margin` overrides
+the margin (a negative value keeps the automatic one derived from the CCD
+tolerance), and `world.broadphase_candidate_count()` reports the pairs the last
+pass emitted.
+
+Contacts and joints are then grouped into solver islands, built only from awake
+dynamic bodies. A shared static floor is deliberately not allowed to merge two
+piles, so disjoint piles stay separate and an island with nothing awake is
+skipped outright. Since two islands share no body, solving them one after
+another is equivalent to a single global Gauss-Seidel sweep, which makes the
+grouping a pure performance change. `world.step_statistics().solver_islands`
+reports the count for the last step.
 
 ### 2D continuous collision detection (CCD)
 
@@ -473,6 +498,11 @@ dependency and is never vendored into Butter.
 - Original TomCat circle/box regressions and activity-aware timing diagnostics
 - Cached velocity geometry, small CCD vertex buffers and sleeping-world fast path
 - Conservative position-correction prefilter covering compound fixture offsets
+- Analytic 2D mass/centroid/inertia recomputation on shape, fixture and density changes
+- Rot-cached contact geometry, structure-of-arrays contact points and a flat open-addressing contact cache
+- 2D uniform grid replaced by a dynamic AABB tree that also backs ray casts and AABB queries
+- 2D hinges upgraded to true revolute constraints with motor, angular limits and warm-started impulses
+- Awake-dynamic solver islands with on-demand CCD geometry, and 2D Box2D-style solve ordering
 
 ### Near-term
 

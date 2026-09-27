@@ -76,7 +76,10 @@ inline std::optional<RaycastHit> ray_shape(Vec2 origin, Vec2 direction, float ma
                     best = hit;
         return best;
     }
-    const auto vertices = world_vertices(shape, transform);
+    // Stack geometry: a heap-allocated world vertex array would dominate the
+    // cost of a box/polygon raycast.
+    const shape_detail::WorldVertices storage(shape, transform);
+    const auto vertices = storage.view();
     if (vertices.size() < 3)
         return std::nullopt;
     float area = 0;

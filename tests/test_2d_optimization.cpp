@@ -215,6 +215,112 @@ int main() try {
                 "CCD index enumerated unrelated vertical pairs");
         require(!stats.limited, "reused CCD workspace retained a limit");
     }
+    // Solver islands. Two disjoint piles must never influence each other: the
+    // second pile's trajectory has to be identical whether or not the first
+    // exists, which is the whole point of solving islands separately.
+    {
+        // Piles are laid out with a hair of overlap so every box in a pile is
+        // already touching its neighbours and the pile is one island from the
+        // very first step.
+        auto pile = [](World &w, float x) {
+            std::vector<Body *> bodies;
+            for (int i = 0; i < 4; ++i) {
+                auto &body = w.create_body()
+                                 .at(x, .5f + float(i) * 0.99f)
+                                 .box(.5f, .5f)
+                                 .restitution(.2f)
+                                 .build();
+                bodies.push_back(&body);
+            }
+            return bodies;
+        };
+        auto make_floor = [](World &w) {
+            auto &floor = w.create_empty_body();
+            floor.type = BodyType::Static;
+            floor.inverse_mass = floor.inverse_inertia = 0;
+            Fixture f;
+            f.shape = Box{{40, .5f}};
+            floor.transform.position = {0, -.5f};
+            w.add_fixture(floor, f);
+        };
+        World solo, duo;
+        make_floor(solo);
+        make_floor(duo);
+        auto a = pile(solo, 0);
+        auto b = pile(duo, 0);
+        pile(duo, 25);
+        solo.step();
+        duo.step();
+        require(duo.step_statistics().solver_islands == 2,
+                "two disjoint piles must be two islands");
+        require(solo.step_statistics().solver_islands == 1,
+                "a single pile must be one island");
+        for (int step = 0; step < 90; ++step) {
+            solo.step();
+            duo.step();
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                const Vec2 delta = a[i]->transform.position - b[i]->transform.position;
+                require(delta.length() < 1.0e-6f &&
+                            std::abs(a[i]->transform.angle - b[i]->transform.angle) < 1.0e-6f,
+                        "an unrelated island changed this pile's trajectory");
+            }
+        }
+    }
+
+    // A pile that is asleep must cost nothing, and disturbing one island must
+    // leave the others alone.
+    {
+        World w;
+        auto &floor = w.create_empty_body();
+        floor.type = BodyType::Static;
+        floor.inverse_mass = floor.inverse_inertia = 0;
+        Fixture f;
+        f.shape = Box{{40, .5f}};
+        floor.transform.position = {0, -.5f};
+        w.add_fixture(floor, f);
+        std::vector<Body *> piles[3];
+        for (int p = 0; p < 3; ++p)
+            for (int i = 0; i < 3; ++i)
+                piles[p].push_back(&w.create_body()
+                                        .at(float(p) * 12.0f - 12.0f, .5f + float(i) * 0.99f)
+                                        .box(.5f, .5f)
+                                        .restitution(0)
+                                        .build());
+        w.step();
+        require(w.step_statistics().solver_islands == 3, "three piles must be three islands");
+        for (int step = 0; step < 240; ++step)
+            w.step();
+        for (auto &stack : piles)
+            for (auto *body : stack)
+                require(body->sleeping, "an isolated pile failed to sleep");
+        w.step();
+        require(w.step_statistics().solver_islands == 0 &&
+                    w.step_statistics().active_constraints == 0,
+                "a sleeping world still ran the solver");
+
+        // Removing the middle pile compacts the body slots every island is
+        // keyed on; the remaining piles must survive that and settle again.
+        for (auto *body : piles[1])
+            w.destroy_body(*body);
+        piles[1] = piles[2];
+        require(w.body_count() == 7, "destroy_body left the slot table stale");
+        // Slide the whole pile so it stays one island while the other one sleeps.
+        for (auto *body : piles[0]) {
+            body->wake();
+            body->velocity = {1, 0};
+        }
+        w.step();
+        require(w.step_statistics().solver_islands == 1,
+                "only the disturbed island should have been solved");
+        for (int step = 0; step < 240; ++step)
+            w.step();
+        for (auto &stack : piles)
+            for (auto *body : stack)
+                require(body->sleeping, "the world stopped settling after a body removal");
+        w.step();
+        require(w.step_statistics().solver_islands == 0, "stale island survived a body removal");
+    }
+
     std::cout << "2D optimization regressions passed\n";
 } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

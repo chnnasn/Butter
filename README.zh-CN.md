@@ -76,7 +76,10 @@ ctest --test-dir build
 | `test_2d_stability` | 大规模落地、箱堆长期静置与关联唤醒/休眠 |
 | `test_2d_tomcat_stack` | TomCat 原始箱体参数、实际时间推进与地板检查 |
 | `test_2d_tomcat_circles` | TomCat 1,000 圆形回归（运行 `test_2d_tomcat_stack 1000 circles`） |
-| `test_2d_optimization` | 宽相暴力对照、缓存失效、全休眠快速路径、运动学运动与顶点/CCD 缓冲 |
+| `test_2d_optimization` | 宽相暴力对照、缓存失效、全休眠快速路径、运动学运动、求解器岛与顶点/CCD 缓冲 |
+| `test_2d_mass` | 圆/盒/多边形质量、质心与转动惯量解析解、fixture 变换 |
+| `test_2d_broadphase` | 动态树代理移动/删除、AABB 查询、射线投射与重算校验 |
+| `test_2d_joints` | revolute 锚点、力臂、负载、motor 力矩上限、角度限位与 distance 回归 |
 
 运行全部测试：
 
@@ -160,7 +163,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`a8e4336` 的 Release、Debug 均通过全部 17 个 CTest 用例（16 个测试程序）。
+当前测试套件共 20 个 CTest 用例（19 个测试程序），Release、Debug 均通过。
 这些是仓库回归测试，与下方外部基准测试分开记录。Windows 下查看 PBD 箱子堆和爆炸示例：
 
 ```powershell
@@ -185,9 +188,9 @@ auto& ball = world.create_body().dynamic().at(0, 5).circle(0.5f).build();
 for (int i = 0; i < 120; ++i) world.step();
 ```
 
-当前 2D 模块包含圆、盒、胶囊、凸多边形和索引三角网格窄相位，
-spatial-grid broadphase、PBD/冲量投影、摩擦、角运动、睡眠、碰撞过滤、
-enter/exit trigger、raycast/AABB 查询、距离约束，以及
+当前 2D 模块包含圆、盒、胶囊、凸多边形和索引三角网格窄相位、
+动态 AABB 树宽相、PBD/冲量投影、摩擦、角运动、睡眠、碰撞过滤、
+enter/exit trigger、raycast/AABB 查询、距离与 revolute 约束，以及
 `physics2d_playground` 示例。`bench_2d [count] [circles|boxes] [awake]` 检查落地正确性，
 分别报告活动与休眠阶段耗时；`awake` 显式保持刚体活动，以便对照。
 这个内部落地基准与下方 TomCat 箱堆基准属于不同场景。
@@ -210,8 +213,24 @@ Builder 与显式 fixture 的混合碰撞对参与求解，但不发布转换回
 显式复合刚体的 fixture 密度仅作为元数据，其质量与惯量由接入层提供。
 
 距离关节支持旋转局部锚点与 `collide_connected`；软关节使用 `spring_stiffness` 和 `damping`。
+铰链是真正的 revolute 约束：`add_hinge_joint(a, b, anchor_a, anchor_b)` 接收两个刚体各自的局部锚点，
+`add_hinge_joint_at(a, b, world_point)` 则把两刚体钉在同一个世界坐标点上。铰链提供
+`motor(speed, max_torque)` 与 `limit(lower, upper)`（或 `no_limit()`）；motor 与限位冲量都会
+warm start，并在该功能被关闭时清零，因此关闭后的 motor 不会继续拉动刚体。
 `Config::max_position_correction` 限制深穿透修正。射线查询检测圆与凸多边形的实际形状，
 包含旋转盒子，并忽略起点位于内部的形状。
+
+### 2D 宽相与求解器岛
+
+2D world 使用动态 AABB 树而非均匀网格。代理带有一个宽松（fat）AABB，只有移动超出
+margin 才会重新插入；同一棵树同时支撑射线投射与 AABB 查询。`Config::broadphase_fat_margin`
+可覆盖该 margin（取负值则沿用由 CCD 容差推导的自动值），`world.broadphase_candidate_count()`
+返回上一次宽相输出的候选对数量。
+
+随后接触与关节会按「唤醒中的动态刚体」划分为求解器岛（solver island）。共享的静态地板
+刻意不会把两堆箱子合并，因此互不相邻的箱堆保持为独立的岛，而没有任何唤醒刚体的岛会被
+直接跳过。由于两个岛不共享任何刚体，依次求解它们与做一次全局 Gauss-Seidel 扫描等价，
+所以岛划分是纯粹的性能改动。`world.step_statistics().solver_islands` 给出上一步的岛数量。
 
 ### 2D 连续碰撞检测（CCD）
 
@@ -412,6 +431,11 @@ Windows 下若 `E:/Github/glfw` 存在，CMake 会自动检测；否则显式传
 - TomCat 原始圆/箱体回归及区分活动状态的计时诊断
 - 速度几何预计算、小型 CCD 顶点缓冲与全休眠快速路径
 - 包含复合 fixture 偏移的位置修正保守预筛选
+- 形状/fixture/密度变化时解析重算 2D 质量、质心与转动惯量
+- 缓存旋转的接触几何、SoA 接触点存储与开放寻址扁平接触缓存
+- 2D 均匀网格换成动态 AABB 树，同一棵树支撑射线投射与 AABB 查询
+- 2D 铰链升级为真正的 revolute 约束，支持 motor、角度限位与热启动冲量
+- 基于唤醒动态刚体的求解器岛、按需构建 CCD 几何，并对齐 Box2D 求解顺序
 
 ### 近期
 
@@ -419,7 +443,7 @@ Windows 下若 `E:/Github/glfw` 存在，CMake 会自动检测；否则显式传
 - 堆叠稳定性和接触求解质量提升
 - 在匹配活动状态的基准下减少密集接触检测和缓存开销
 - 优化串行流程时保持薄墙 CCD 与长期静置稳定性
-- 更多关节：滑轨、固定、马达
+- 更多关节：滑轨、固定
 
 ### 中期
 

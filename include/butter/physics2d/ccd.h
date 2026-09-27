@@ -289,6 +289,7 @@ struct CcdMotion {
     float *angular_velocity{};
     bool *sleeping{};
     int *sleep_counter{};
+    Vec2 local_center{}; // Centroid offset in body space; pure rotation pivots here.
     float inverse_mass{}, inverse_inertia{};
     bool dynamic{}, kinematic{}, bullet{};
     std::vector<CcdCollider> colliders;
@@ -296,11 +297,22 @@ struct CcdMotion {
     bool moves() const { return !blocked && (kinematic || (dynamic && (!sleeping || !*sleeping))); }
     Vec2 linear() const { return moves() ? *velocity : Vec2{}; }
     float angular() const { return moves() ? *angular_velocity : 0; }
-    ShapeSweep sweep(float dt, const CcdCollider &f) const {
-        return {*transform,
-                {transform->position + linear() * dt, transform->angle + angular() * dt},
-                f.local};
+    // Terminal transform after `duration`. A rigid body rotates about its
+    // centroid, so the body origin is recovered from the advanced centroid.
+    Transform advanced(float duration) const {
+        Transform result = *transform;
+        const float angle = transform->angle + angular() * duration;
+        if (local_center.x == 0 && local_center.y == 0)
+            result.position = transform->position + linear() * duration;
+        else {
+            const Vec2 center = transform->position + rotate(local_center, Rot(transform->angle));
+            result.position = center + linear() * duration - rotate(local_center, Rot(angle));
+        }
+        result.angle = angle;
+        return result;
     }
+    void integrate(float duration) { *transform = advanced(duration); }
+    ShapeSweep sweep(float dt, const CcdCollider &f) const { return {*transform, advanced(dt), f.local}; }
     void wake() {
         if (dynamic && sleeping && *sleeping) {
             if (sleeping)
@@ -344,10 +356,8 @@ inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, fl
         return stats;
     auto advance = [&](float duration) {
         for (auto &b : bodies)
-            if (b.moves()) {
-                b.transform->position += b.linear() * duration;
-                b.transform->angle += b.angular() * duration;
-            }
+            if (b.moves())
+                b.integrate(duration);
     };
     for (auto &b : bodies)
         b.blocked = false;
@@ -377,9 +387,14 @@ inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, fl
             AABB total{};
             for (auto &f : x.colliders) {
                 auto sweep = x.sweep(remaining, f);
+                // Rotation pivots on the centroid, so the bound must also cover
+                // the lever from the body origin to the centroid.
+                const float reach = x.local_center.length();
                 auto box = std::abs(sweep.end.angle - sweep.start.angle) < 1e-8f
                                ? compute_aabb(*f.shape, sweep.at(0))
                                : ccd_detail::swept_bounds(*f.shape, sweep);
+                box.min -= Vec2{reach, reach};
+                box.max += Vec2{reach, reach};
                 if (std::abs(sweep.end.angle - sweep.start.angle) < 1e-8f) {
                     auto end = compute_aabb(*f.shape, sweep.at(1));
                     box.min.x = std::min(box.min.x, end.min.x);
