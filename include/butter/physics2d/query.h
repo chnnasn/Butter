@@ -67,6 +67,78 @@ inline std::optional<RaycastHit> ray_shape(Vec2 origin, Vec2 direction, float ma
         const Vec2 point = origin + direction * distance;
         return RaycastHit{index, point, (point - transform.position).normalized(), distance};
     }
+    if (const auto *capsule = std::get_if<Capsule>(&shape)) {
+        // Exact, and the reason it has to be spelled out: the shape fallback
+        // below is a convex polygon raycast, and a capsule's outline as a vertex
+        // list is an *inscribed* eighteen-gon. A ray grazing the round end would
+        // then miss a capsule it geometrically hits, and the ray query would
+        // disagree with the discrete test about the same shape.
+        //
+        // A capsule is the set of points within `radius` of the segment, so the
+        // surface is two caps and a barrel. Solving all three exactly and taking
+        // the nearest accepted root is the whole algorithm; the caps only own a
+        // hit that lands on their own side of the segment, and the barrel only
+        // owns one that lands between the two caps.
+        const CapsuleSegment segment = capsule_segment(*capsule, transform);
+        const Vec2 edge = segment.b - segment.a;
+        const float length2 = edge.length_squared();
+        const float radius = capsule->radius;
+        // Rays that begin inside a shape are ignored, exactly as for a circle.
+        if ((origin - closest_on_segment(origin, segment.a, segment.b)).length_squared() <
+            radius * radius)
+            return std::nullopt;
+        float best = max_distance + 1;
+        auto consider = [&](float t) {
+            if (t >= 0 && t <= max_distance)
+                best = std::min(best, t);
+        };
+        auto cap = [&](Vec2 center, bool upper) {
+            const Vec2 offset = origin - center;
+            const float b = offset.dot(direction), c = offset.length_squared() - radius * radius;
+            const float disc = b * b - c;
+            if (disc < 0)
+                return;
+            const float t = -b - std::sqrt(disc);
+            if (t < 0 || t > max_distance)
+                return;
+            const float along = (origin + direction * t - segment.a).dot(edge);
+            if (upper ? along >= length2 : along <= 0)
+                consider(t);
+        };
+        cap(segment.a, false);
+        cap(segment.b, true);
+        // Barrel: the ray against the infinite cylinder, then discard any root
+        // that lies outside the segment's own span. |direction| is one, so the
+        // quadratic is a*t^2 + 2*b*t + c with the coefficients below.
+        if (length2 > 1.0e-12f) {
+            const Vec2 w = origin - segment.a;
+            const float dw = direction.dot(edge), ew = w.dot(edge);
+            const float a = length2 - dw * dw;
+            if (a > 1.0e-12f) {
+                const float b = length2 * w.dot(direction) - dw * ew;
+                const float c = length2 * w.length_squared() - ew * ew - length2 * radius * radius;
+                const float disc = b * b - a * c;
+                if (disc >= 0) {
+                    const float t = (-b - std::sqrt(disc)) / a;
+                    if (t >= 0 && t <= max_distance) {
+                        const float along = ew + dw * t;
+                        if (along >= 0 && along <= length2)
+                            consider(t);
+                    }
+                }
+            }
+        }
+        if (best > max_distance)
+            return std::nullopt;
+        const Vec2 point = origin + direction * best;
+        const Vec2 closest = closest_on_segment(point, segment.a, segment.b);
+        const Vec2 outward = point - closest;
+        const Vec2 normal =
+            outward.length_squared() > 1.0e-12f
+                ? outward.normalized()
+                : (length2 > 1.0e-12f ? (segment.a - segment.b).normalized() : Vec2{0, 1});
+        return RaycastHit{index, point, normal, best};
+    }
     if (const auto *mesh = std::get_if<Mesh>(&shape)) {
         std::optional<RaycastHit> best;
         for (const auto &triangle : mesh->triangles)

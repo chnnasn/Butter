@@ -9,6 +9,18 @@
 
 // Counts ordinary C++ allocations made on this serial benchmark thread.
 // Allocation timing is included in total/stage timings, not an additive stage.
+//
+// Usage: bench_2d [count] [circles|boxes] [awake] [staggered]
+//   count      1..10000 bodies resting on a static floor
+//   awake      an explicit workload mode that re-wakes every body each frame;
+//              it is not a relaxation of the engine's sleep thresholds and the
+//              forced-awake numbers are only comparable with each other
+//   staggered  lifts each body to its own height, so the movers land at
+//              different times and an independent CCD timeline per island is
+//              actually exercised
+// The run also carries a correctness gate: a lone kinematic body placed far
+// from the pile must keep its prescribed motion to the frame, and every resting
+// body must stay out of the floor.
 static std::size_t allocation_calls = 0, allocation_bytes = 0;
 static double allocation_ms = 0;
 void *operator new(std::size_t bytes) {
@@ -40,20 +52,28 @@ int main(int argc, char **argv) try {
         throw std::invalid_argument("body count must be 1..10000");
     bool boxes = argc > 2 && std::string(argv[2]) == "boxes";
     bool keep_awake = argc > 3 && std::string(argv[3]) == "awake";
+    bool staggered = argc > 4 && std::string(argv[4]) == "staggered";
     World w;
     w.create_body().static_body().at(0, -.05f).box(float(count), .05f).build();
     std::vector<Body *> bodies;
     for (int i = 0; i < count; ++i) {
-        auto b = w.create_body().at((i - count * .5f) * 1.1f, 1).restitution(0);
+        auto b = w.create_body().at((i - count * .5f) * 1.1f, staggered ? 1 + i * .3f : 1).restitution(
+            0);
         if (boxes)
             b.box(.5f, .5f);
         else
             b.circle(.5f);
         bodies.push_back(&b.build());
     }
-    auto &probe = w.create_body().kinematic().at(-float(count) - 10, 0).velocity(0, 1).build();
+    // One kinematic body far from the pile. With island scheduling it must not
+    // drag the other movers onto its timeline, and its own prescribed motion
+    // must come out exactly as commanded. Both are checked below.
+    auto &probe =
+        w.create_body().kinematic().at(-float(count) - 10, 0).velocity(0, 1).build();
     Totals totals[2];
     int limited = 0;
+    std::size_t ccd_sweeps = 0, ccd_bounds = 0, ccd_candidates = 0, ccd_stationary = 0,
+                ccd_persistent = 0;
     for (int frame = 0; frame < 360; ++frame) {
         // An explicit workload mode, not a relaxation of the engine's sleep
         // thresholds. Compare this only with other forced-awake runs.
@@ -88,6 +108,11 @@ int main(int argc, char **argv) try {
         t.bytes += allocation_bytes - bytes;
         t.allocation += allocation_ms - ams;
         limited += w.ccd_statistics().limited;
+        ccd_sweeps += w.ccd_statistics().sweeps;
+        ccd_bounds += w.ccd_statistics().bounds_tests;
+        ccd_candidates += w.ccd_statistics().candidates;
+        ccd_stationary += w.ccd_statistics().stationary_tests;
+        ccd_persistent += w.ccd_statistics().persistent_contacts;
         for (auto *b : bodies)
             if (compute_aabb(b->shape, b->transform).min.y < -.025f)
                 throw std::runtime_error("correctness gate: floor penetration");
@@ -102,6 +127,7 @@ int main(int argc, char **argv) try {
     if (limited)
         throw std::runtime_error("correctness gate: simple landings required CCD clamps");
     std::cout << "PASS count=" << count << " shape=" << (boxes ? "boxes" : "circles")
+              << " layout=" << (staggered ? "staggered" : "flat")
               << " simulated_seconds=" << w.simulation_time()
               << " sleeping=" << (keep_awake ? 0 : count)
               << " mode=" << (keep_awake ? "forced_awake" : "natural_sleep") << '\n';
@@ -118,6 +144,9 @@ int main(int argc, char **argv) try {
                   << " ordinary_allocations=" << t.allocations << " allocated_bytes=" << t.bytes
                   << " allocation_ms_inclusive=" << t.allocation << '\n';
     }
+    std::cout << "ccd_work sweeps=" << ccd_sweeps << " bounds_tests=" << ccd_bounds
+              << " candidates=" << ccd_candidates << " stationary_tests=" << ccd_stationary
+              << " persistent=" << ccd_persistent << '\n';
     std::cout << "TomCat adapter: unavailable in this repository. Compare only "
                  "matching activity counts and correctness gates; no historical "
                  "speedup ratio.\n";

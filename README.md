@@ -80,6 +80,13 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_2d_mass` | Analytic circle/box/polygon mass, centroid and inertia, fixture transforms |
 | `test_2d_broadphase` | Dynamic-tree proxy moves, removals, AABB queries, ray casts and recompute validation |
 | `test_2d_joints` | Revolute anchors, lever arms, load, motor torque cap, angular limits and distance regression |
+| `test_2d_capsule` | Capsule as exact geometry: discrete test, ray query, sweep and CCD agree on one shape |
+| `test_2d_contact_refresh` | Contacts maintained across the second detection pass instead of rebuilt |
+| `test_2d_obstacles` | Position-correction safety over a pile plus thousands of static obstacles |
+| `test_2d_substeps` | `Config::substeps` buys stacking accuracy and costs nothing when off |
+| `test_2d_solver_options` | Position relaxation, interleaved joints and over-correction guards |
+| `test_2d_lifetime` | Destroying a body disturbs only its own contacts, joints and slots |
+| `test_2d_mesh` | Mesh index cost, boundary-surface contacts, seam normals and two-point manifolds |
 
 Run all tests:
 
@@ -197,11 +204,15 @@ The 2D module includes circle, box, capsule, convex polygon and indexed
 triangle mesh narrow phase, a dynamic AABB-tree broadphase, PBD/impulse
 projection, friction, angular motion, sleeping, collision filtering, enter/exit
 triggers, raycast/AABB queries, distance and revolute constraints and a
-`physics2d_playground` example. `bench_2d [count] [circles|boxes] [awake]` checks landing correctness and
-reports active and sleeping costs separately; `awake` explicitly keeps bodies
-active for comparisons. This internal landing benchmark differs from the TomCat
-stack benchmark below. A dedicated internal mesh BVH remains a future optimization. The 2D module now
-includes conservative swept CCD for circles, boxes and convex polygons.
+`physics2d_playground` example. `bench_2d [count] [circles|boxes] [awake] [staggered]`
+checks landing correctness and reports active and sleeping costs separately; `awake`
+explicitly keeps bodies active for comparisons, and `staggered` drops each body from
+its own height so an independent CCD timeline per island is actually exercised. This
+internal landing benchmark differs from the TomCat stack benchmark below. The 2D
+module now includes conservative swept CCD for circles, boxes, capsules and convex
+polygons; meshes are still discrete, because conservative advancement needs a closed
+form support function that a non-convex triangle set does not have. The mesh itself
+carries an internal BVH, described under "2D mesh acceleration and surface" below.
 
 ### Engine integration with explicit fixtures
 
@@ -254,6 +265,30 @@ another is equivalent to a single global Gauss-Seidel sweep, which makes the
 grouping a pure performance change. `world.step_statistics().solver_islands`
 reports the count for the last step.
 
+### 2D mesh acceleration and surface
+
+A 2D `Mesh` carries its own BVH over its triangles, built from them and invalidated
+whenever the vertices change. A query descends the index instead of walking every
+triangle, so the triangle count stops appearing in the per-step cost: a mesh of 80
+triangles costs 22.16 triangle tests per step and one of 3,200 costs 24.03, a 40x
+triangle count for 1.08x work. The mesh's world bounds are read off the index
+rather than re-derived from every triangle, and `mesh_triangle_tests()` reports the
+running count so the property can be asserted rather than assumed.
+
+A mesh's *surface* is its boundary. The cut between two adjacent triangles is
+inside the material and can never generate a contact, so a body that ends up
+inside a terrain is ejected through the nearest surface edge and not through a cut.
+That edge carries its own outward normal: for a body that has gone past the edge,
+the direction from the edge to the body's centre points inward, and following it
+would drive the body further into the floor. A mesh contact also gets a real
+two-point manifold, so a box resting on a mesh floor is supported across the face
+it touches instead of at the single fallback point.
+
+A seam is not a feature. A box sliding across a hundred-triangle mesh floor
+crosses ninety-nine seams and ends at exactly the same place as it does across a
+single quad (`x=8.06117, y=0.5` for both), because coplanar boundary edges are
+merged before the contact is built.
+
 ### 2D continuous collision detection (CCD)
 
 2D worlds enable CCD by default for dynamic bodies against static and kinematic
@@ -262,10 +297,10 @@ sweep dynamic/dynamic pairs when either body is a bullet. `config.ccd.enabled =
 false` restores discrete stepping. The 3D solver is unchanged.
 
 CCD uses swept bounds and separating-plane conservative advancement for circles,
-boxes and convex polygons. Both bodies' translation and unwrapped angular travel
-are included, including rotating local fixture offsets. It advances to the
-earliest time of impact, applies restitution/friction impulses, then sweeps the
-remaining time again. Forces and damping are integrated once per outer step.
+boxes, capsules and convex polygons. Both bodies' translation and unwrapped
+angular travel are included, including rotating local fixture offsets. It advances
+to the earliest time of impact, applies restitution/friction impulses, then sweeps
+the remaining time again. Forces and damping are integrated once per outer step.
 Fixture masks, the custom contact filter, and non-colliding connected joints are
 respected. Explicit fixtures emit contact transitions for CCD impacts, including
 an enter/exit pair for a bounce that separates within the same step.
@@ -287,11 +322,23 @@ against static and kinematic obstacles, including thin walls absent from the
 original contact candidates. Connected dynamic bodies wake and sleep together;
 a shared static floor does not join otherwise independent groups.
 
-Capsules and meshes still use discrete collision detection. Sensors retain
-endpoint overlap semantics and do not block CCD motion. Authored teleports are
-not swept, and initial penetrations require discrete recovery. Polygons must be
-convex and nondegenerate, and rotations are unwrapped (a full turn is `2*pi`, not
-zero). Position guards cover the same convex shapes as CCD.
+Meshes still use discrete collision detection: conservative advancement needs a
+support function in closed form, which a non-convex triangle soup does not have.
+Sensors retain endpoint overlap semantics and do not block CCD motion. Authored
+teleports are not swept, and initial penetrations require discrete recovery.
+Polygons must be convex and nondegenerate, and rotations are unwrapped (a full
+turn is `2*pi`, not zero). Position guards cover the same convex shapes as CCD.
+
+CCD is scheduled per swept island rather than per scene. Movers are partitioned by
+whether one of them can actually change the other's path through an impulse, so a
+lone bullet or a moving platform no longer forces every unrelated mover onto one
+shared timeline. Each island is then advanced to its own end of step inside a
+single call, which keeps the stationary index built once instead of once per
+island. On 1,000 staggered circles this drops CCD work from 926,000 to 360,566
+bounds tests and CCD time from 60.7 ms to 33.0 ms per 360 frames, while the
+already-resting trajectories stay bit-identical. Bullets and kinematic bodies
+remain coupled to everything they can reach; the partition only stops coupling the
+things they cannot.
 
 See [TomCat zero-time CCD follow-up](docs/ccd-zero-time-followup.md) for the original
 fixture-based stack reproduction and independent static-environment timelines.
@@ -357,6 +404,11 @@ See [implementation, invalidation rules and validation](docs/serial-optimization
 and [108 raw samples](docs/benchmarks/projection-followup-20260921.csv).
 The raw file's `baseline9` means `9baad05`; `retest` means the code committed as `a8e4336`.
 Reproduction commands are in the [examples and diagnostics guide](examples/README.md#2d-regressions-and-benchmarks).
+
+That report also carries the later follow-ups: contact/derivation/obstacle/lifetime
+structure, the measured solver-arrangement comparison (sub-steps, position relaxation,
+compliant contacts, interleaved joints), the mesh and capsule consistency work, and the
+per-island CCD scheduling described above with its work-counter tables.
 
 ### External Box2D reference: `52f15a5`
 
@@ -503,10 +555,17 @@ dependency and is never vendored into Butter.
 - 2D uniform grid replaced by a dynamic AABB tree that also backs ray casts and AABB queries
 - 2D hinges upgraded to true revolute constraints with motor, angular limits and warm-started impulses
 - Awake-dynamic solver islands with on-demand CCD geometry, and 2D Box2D-style solve ordering
+- Versioned shape/material/filter derivations with dirty registration, so each body's derived data is rebuilt once per step
+- Persistent contact maintenance: a contact survives its geometry refresh and only its solve parameters are updated
+- Static/kinematic obstacle index so a position correction only tests local candidates
+- Measured solver-arrangement comparison (sub-steps vs iterations, position relaxation, `interleave_joints`) in `bench_2d_solver_quality`
+- 2D capsules swept by CCD; mesh BVH with boundary-surface contacts, seam-merged normals and real two-point manifolds
+- CCD scheduled per swept island, so a lone bullet or moving platform no longer couples unrelated movers onto one timeline
+- Generation-based body handles with local contact/constraint cleanup on destroy, and movable slot reuse
 
 ### Near-term
 
-- Extend CCD to 3D, capsules and meshes
+- Extend CCD to 3D, and to 2D meshes
 - Better stacking stability and contact quality
 - Reduce dense-contact detection and cache overhead with matched-activity benchmarks
 - Preserve thin-wall CCD and long-term stability while optimizing serial work

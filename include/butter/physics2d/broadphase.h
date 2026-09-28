@@ -111,9 +111,35 @@ class DynamicTree {
             stack.pop_back();
             if (!nodes_[index].box.overlaps(box))
                 continue;
+            if (nodes_[index].leaf())
             if (nodes_[index].leaf()) {
                 if (fatten(nodes_[index].tight, margin).overlaps(box))
                     visit(nodes_[index].payload);
+                continue;
+            }
+            stack.push_back(nodes_[index].child1);
+            stack.push_back(nodes_[index].child2);
+        }
+    }
+
+    // Like query(), but stops the traversal as soon as `visit` returns false.
+    // Position correction only needs to know whether any obstacle is near, so
+    // it does not have to enumerate the whole neighbourhood.
+    template <class Visitor> void query_any(const AABB &box, float margin, Visitor &&visit) const {
+        if (root_ == null_node)
+            return;
+        auto &stack = query_stack_;
+        stack.clear();
+        stack.push_back(root_);
+        while (!stack.empty()) {
+            const std::uint32_t index = stack.back();
+            stack.pop_back();
+            if (!nodes_[index].box.overlaps(box))
+                continue;
+            if (nodes_[index].leaf()) {
+                if (fatten(nodes_[index].tight, margin).overlaps(box) &&
+                    !visit(nodes_[index].payload))
+                    return;
                 continue;
             }
             stack.push_back(nodes_[index].child1);

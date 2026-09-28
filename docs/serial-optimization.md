@@ -46,9 +46,11 @@ step, avoiding accumulated floating-point position error in long observations.
   independent groups, and sleep thresholds were not increased.
 - CCD retains caller-owned workspace and selects the sweep axis using spatial
   spread, avoiding quadratic X-interval enumeration in tall sparse layouts.
-  Bounds are rebuilt after impulses because trajectories change. Existing
-  bullet/kinematic coupling and the static-environment partition limit remain;
-  this is not a general new island TOI scheduler.
+  Bounds are rebuilt after impulses because trajectories change. The partition
+  that bullet/kinematic coupling used to force on the whole scene is now a
+  per-island timeline; see [CCD scheduling follow-up](#ccd-scheduling-follow-up)
+  for what it changed and what it still does not do (no general per-island TOI
+  scheduler with cross-island carried momentum).
 - Polygon AABB construction no longer allocates a world-vertex array.
 
 ## Diagnostics and reproduction
@@ -238,3 +240,167 @@ New regression cases cover an offset compound foot pushed toward a thin floor
 by contact at another fixture, and thin-wall CCD for 4/16/17/64-vertex polygons.
 Local timing, state and long-run logs are under `build/projection-followup*`;
 the final timing log is `build/projection-followup-final.txt`.
+
+## Structure follow-up: derivations, contacts, obstacles and lifetime
+
+Four pieces of structure that used to be rebuilt from the world on every step are
+now maintained, and each has an acceptance test that states what it may disturb.
+
+**Derived data.** A body's derived geometry, mass properties and filter data are
+rebuilt only when a version counter says a public field changed. Shape, material
+and filter each carry their own counter, so editing a material does not invalidate
+geometry, and each body's derived values are computed at most once per step.
+
+**Contacts.** A step detects contacts twice, before and after integration. The
+second pass used to rebuild the whole contact set -- narrow phase, filter and
+fixture pairing for every pair in the world, moving every constraint in the array
+and so changing the order the solver visits them in. It now refreshes only the
+pairs that moved and rewrites the constraints in place, falling back to the rebuild
+when most of the world moved. `test_2d_contact_refresh` pins both halves.
+
+**Position-correction obstacles.** The guard that stops a correction from pushing a
+body through static geometry walked a sorted list of every obstacle in the world.
+The acceptance scene was "a pile and a floor", which is exactly the scene where a
+linear scan is already cheap; the scene that matters is a pile plus thousands of
+walls. The guard now queries a spatial index of the static and kinematic bodies.
+`test_2d_obstacles` measures the tower with 0, 2,000 and 8,000 parked obstacles:
+
+| Parked obstacles | total ms | CCD ms | guard ms |
+| ---: | ---: | ---: | ---: |
+| 0 | 16.34 | 1.33 | 4.43 |
+| 2,000 | 65.86 | 10.25 | 10.05 |
+| 8,000 | 262.13 | 44.57 | 13.75 |
+
+The marginal cost is about 102 ns per obstacle per frame across the whole step, and
+the guard's own share grows sub-linearly (4.43 -> 10.05 -> 13.75 ms) because its
+candidate list is local. This is a scene comparison over the same tower, not a
+speedup claim against an older revision.
+
+**Lifetime.** Destroying a body used to mean clearing the contact cache and the
+whole constraint array plus marking the broad phase dirty, then erasing the body
+from the middle of the array and renumbering every slot after it. Removing one
+object therefore cost every other body its contacts, manifolds and accumulated
+impulses, and the whole index was refiled. Destroying a body or fixture now drops
+only the constraints that touch it, erases only its contacts, refreshes only its
+proxies, and reuses the freed slot by swap-and-pop. Body handles are slot index
+plus generation, so a stale handle is detectable instead of silently addressing the
+body that took the slot.
+
+`test_2d_lifetime` (2,027 checks) states the contract:
+
+- a settled stack run with and without an unrelated body differs by 0 in every pose;
+- adding one body and destroying it returns `broadphase_candidate_count()` to its
+  previous value (10 -> 11 -> 10 evaluated candidates);
+- a five-link chain with its middle link destroyed drops `joint_count()` from 5 to
+  3, loses one body, and the surviving chain still hangs from the anchor
+  (heights 7.5 -> 7, the detached link falls to 0.2499).
+
+Two out-of-bounds writes were found and fixed while writing this test: the
+generation counter was incremented past the last slot when the destroyed body was
+the last one, and `neighbors_[index]` was written when the broad phase had never
+been synchronised and the per-slot views did not exist yet.
+
+## Solver arrangement follow-up
+
+`bench_2d_solver_quality` sweeps `solver_iterations` x `substeps` over five scenes
+and, at each scene's own best budget, sweeps the contact/joint arrangement. Every
+body is forced awake every frame and accuracy is read off the bodies' own
+transforms, so nothing wins by freezing earlier. Three arrangements were measured
+rather than assumed:
+
+- **`Config::substeps`** is the lever that changes *how* a frame is solved. On the
+  1,000-box column, one sub-step at the default needs `iter=8` to reach top height
+  14.53, while `iter=4 sub=4` reaches 20.41 against a contact height of 19.5 --
+  more accuracy per unit of time than more iterations buys. It costs nothing when
+  left at 1, which `test_2d_substeps` (22 checks) pins down.
+- **`Config::position_relaxation`** is the only handle on a settled stack's steady
+  penetration, and it is proportional: 0.2 -> 22.21 mm compression, 0.8 -> 19.87,
+  1.0 -> 19.46 on the 20-box column. Raising it trades jitter in a badly
+  conditioned scene for proportionally less sink. Over-correction guards hold at
+  its maximum (a dropped box settles at y=0.50005, a 50 m/s slider stops at
+  x=2.99995 against a wall whose near face is at 3.5).
+- **`Config::contact_stiffness`** is a compliant-contact knob, off by default
+  because at equal budget it makes the column and mass-ratio scenes worse (+72.6%
+  and +406.0% primary) while helping only a joint chain whose links also touch
+  (-66.7%). It is kept, and reproducible, because those numbers are the answer to
+  "should the contact be made compliant" rather than an assertion.
+- **`Config::interleave_joints`** solves each island's joints inside the contact
+  iteration instead of once after the contacts. On the 24-link chain in
+  `test_2d_solver_options` the worst joint gap during the swing halves, 0.00865 m to
+  0.00447 m; the settled gap is the same reading either way. It is off by default
+  because it is a different solve order and the default order is what every
+  recorded trajectory was measured against.
+
+`test_2d_solver_options` (27 checks) holds all four to account, including that a
+bigger correction may not throw a body off an obstacle or push it into one.
+
+## Mesh and capsule follow-up
+
+**Capsules are exact geometry.** A capsule was fed to the narrow phase as an
+inscribed eighteen-gon, which is a different shape: the flat side is only flat at
+its vertices. Discrete test, ray query, sweep and CCD now all describe the same
+set -- points within `radius` of a segment -- and `test_2d_capsule` (2,868 checks)
+checks them against each other. Conservative advancement needs a support function
+and a bounded projection in closed form, and a capsule has both, so listing it made
+a fast capsule stop passing through a thin floor that the discrete narrow phase was
+happily generating a resting contact for.
+
+**A mesh is indexed and its surface is its boundary.** A 2D `Mesh` carries a BVH
+over its triangles, built from them and invalidated when vertices change. A query
+descends the index; the mesh's world bounds are read off it rather than re-derived
+per triangle. `mesh_triangle_tests()` reports the running count:
+
+| Triangles | Triangle tests per step |
+| ---: | ---: |
+| 80 | 22.16 |
+| 3,200 | 24.03 |
+
+A 40x triangle count costs 1.08x work. The cuts between adjacent triangles are
+inside the material and can never generate a contact, so a body that ends up inside
+a terrain is ejected through the nearest surface edge, along that edge's outward
+normal -- following the direction from the edge to the body's centre would drive it
+further in. A mesh contact gets a real two-point manifold: a box resting on a mesh
+floor reports one constraint with two warm-started points, not the single fallback
+point the face clipper produced when the mesh reached it with no vertices.
+
+A seam is not a feature. A box sliding across a hundred-triangle floor crosses
+ninety-nine seams and ends at exactly the same place as it does across a single
+quad (`x=8.06117, y=0.5` for both), because coplanar boundary edges are merged
+before the contact is built. `test_2d_mesh` (21 checks) covers all of the above.
+
+## CCD scheduling follow-up
+
+Any scene containing a bullet or a kinematic body used to be handed to the coupled
+scheduler in its entirety: every mover advanced to the earliest impact, then every
+mover rescanned, for each impact in the scene. A single bullet nowhere near anything
+therefore made forty unrelated impacts cost forty rescans of every moving body.
+
+Movers are now partitioned into swept islands on exactly the relation the pair test
+uses. Two dynamics only meet through CCD when one of them is a bullet, and a
+kinematic body is prescribed motion that absorbs nothing -- the box it knocks aside
+cannot turn around and change where the platform goes -- so a moving platform
+couples to everything it sweeps through but not to what those things do afterwards.
+Each island is solved on its own timeline inside one call, which keeps the
+stationary index built once instead of once per island.
+
+`bench_2d [count] circles awake staggered` places a lone kinematic body far from a
+pile of staggered circles, so the movers land at different times and an independent
+timeline per island is actually exercised. Compared with the pre-partition
+scheduler, using work counters rather than wall time:
+
+| Bodies | Bounds tests, group | Bounds tests, islands | Sweeps, islands |
+| ---: | ---: | ---: | ---: |
+| 100 | 46,000 | 36,100 | 100 |
+| 400 | 304,000 | 144,400 | 400 |
+| 1,000 | 926,000 | 360,566 | 1,000 |
+
+The island count scales linearly (36,100 -> 360,566 for ten times the bodies) where
+the group scheduler scaled superlinearly (46,000 -> 926,000). At 1,000 bodies CCD
+time falls from about 60.7 ms to 33.0 ms over 360 frames and whole-step time from
+about 307 ms to 280 ms. `test_2d_ccd` (445 checks) covers the partition, including
+that a bullet and a kinematic body stay coupled to everything they can reach, and
+`test_2d_tomcat_stack 1000 boxes 360` still reports the same trajectory fingerprint
+(`corrections=4336238`, `projection_candidates=348962`, `cached_contacts=9137`,
+`projection_fast_rejections=8247690`), so the recorded trajectories are unchanged by
+the scheduling.
+

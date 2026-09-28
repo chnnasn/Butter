@@ -266,6 +266,26 @@ int main() try {
         check(enters == 2 && exits == 2, "transient CCD bounce must emit enter and exit");
     }
     {
+        // A restitution written straight onto a fixture has to reach the
+        // continuous pass. Its collider view is cached between steps, so a view
+        // that only followed *movement* would keep the restitution it filed
+        // first and swallow the bounce: the material is part of what the view
+        // caches, and the edit registry is what has to report it.
+        World w(config());
+        wall(w);
+        auto &ball = shot(w);
+        w.step();
+        const float stopped = ball.transform.position.x;
+        check(stopped < -0.05f && stopped > -0.3f, "the shot did not stop at the wall");
+        ball.transform.position = {-5, 0};
+        ball.velocity = {600, 0};
+        ball.material.restitution = 1;
+        w.step();
+        check(ball.transform.position.x < stopped - 1.0f && ball.velocity.x < -100.0f,
+              "a restitution written straight onto a fixture was not seen by the continuous "
+              "pass");
+    }
+    {
         World w(config());
         auto &sleeping = shot(w, 0, 0);
         sleeping.sleeping = true;
@@ -598,6 +618,128 @@ int main() try {
         for (auto &d : stopped.diagnostics)
             check((d.body_a == 0 && d.body_b == 1) || (d.body_a == 1 && d.body_b >= 2),
                   "partitioned diagnostic body indices were not remapped");
+    }
+    {
+        // A bullet must not put the whole world on its timeline. The partition
+        // is the pair test's own relation, so a bullet in its own corner is an
+        // island of one -- and the answer has to be the one the coupled
+        // scheduler would have given.
+        struct State {
+            std::array<Transform, 43> transforms{};
+            std::array<Vec2, 43> velocities{};
+            std::array<float, 43> angular{};
+        } a, b;
+        Shape floor = Box{{100, .01f}}, dot = Circle{.05f};
+        auto views = [&](State &s) {
+            std::vector<CcdMotion> result(43);
+            for (int i = 0; i < 43; ++i) {
+                auto &m = result[i];
+                m.transform = &s.transforms[i];
+                m.velocity = &s.velocities[i];
+                m.angular_velocity = &s.angular[i];
+                m.dynamic = i != 0;
+                m.inverse_mass = m.dynamic ? 1.f : 0.f;
+                m.colliders.push_back({i == 0 ? &floor : &dot});
+                s.transforms[i].position =
+                    i == 0 ? Vec2{0, -.01f} : Vec2{float(i) - 21, 2 + float(i) * .02f};
+                s.velocities[i] = i == 0 ? Vec2{} : Vec2{0, -600};
+            }
+            result[42].bullet = true;
+            return result;
+        };
+        auto independent = views(a), coupled = views(b);
+        auto fast = advance_continuous(independent, .01f);
+        auto reference = advance_continuous_group(coupled, .01f);
+        check(fast.impacts == 42 && reference.impacts == 42 && !fast.limited,
+              "independent CCD lost a collision beside a bullet");
+        for (int i = 0; i < 43; ++i)
+            check((a.transforms[i].position - b.transforms[i].position).length() < .0001f &&
+                      (a.velocities[i] - b.velocities[i]).length() < .0001f,
+                  "independent CCD changed a trajectory beside a bullet");
+        check(fast.sweeps * 2 < reference.sweeps,
+              "a bullet still rescanned every moving body");
+    }
+    {
+        // The same for a kinematic obstacle. It is prescribed motion: whatever
+        // it sweeps through has to share its island, and nothing else does.
+        struct State {
+            std::array<Transform, 43> transforms{};
+            std::array<Vec2, 43> velocities{};
+            std::array<float, 43> angular{};
+        } a, b;
+        Shape floor = Box{{100, .01f}}, dot = Circle{.05f}, slab = Box{{30, .1f}};
+        auto views = [&](State &s) {
+            std::vector<CcdMotion> result(43);
+            for (int i = 0; i < 43; ++i) {
+                auto &m = result[i];
+                m.transform = &s.transforms[i];
+                m.velocity = &s.velocities[i];
+                m.angular_velocity = &s.angular[i];
+                m.dynamic = i != 0 && i != 42;
+                m.kinematic = i == 42;
+                m.inverse_mass = m.dynamic ? 1.f : 0.f;
+                m.colliders.push_back({i == 0 ? &floor : i == 42 ? &slab : &dot});
+                s.transforms[i].position = i == 0    ? Vec2{0, -.01f}
+                                           : i == 42 ? Vec2{0, 100}
+                                                     : Vec2{float(i) - 21, 2 + float(i) * .02f};
+                s.velocities[i] = i == 0 ? Vec2{} : i == 42 ? Vec2{600, 0} : Vec2{0, -600};
+            }
+            return result;
+        };
+        auto independent = views(a), coupled = views(b);
+        auto fast = advance_continuous(independent, .01f);
+        auto reference = advance_continuous_group(coupled, .01f);
+        check(fast.impacts == 41 && reference.impacts == 41 && !fast.limited,
+              "independent CCD lost a collision beside a kinematic obstacle");
+        for (int i = 0; i < 43; ++i)
+            check((a.transforms[i].position - b.transforms[i].position).length() < .0001f &&
+                      (a.velocities[i] - b.velocities[i]).length() < .0001f,
+                  "independent CCD changed a trajectory beside a kinematic obstacle");
+        check(fast.sweeps * 2 < reference.sweeps,
+              "a kinematic obstacle still rescanned every moving body");
+    }
+    {
+        // A bullet that does share a swept span is one island with the body it
+        // reaches, so the pair still resolves on a single timeline.
+        Shape dot = Circle{.05f};
+        struct State {
+            std::array<Transform, 3> transforms{};
+            std::array<Vec2, 3> velocities{};
+            std::array<float, 3> angular{};
+        } a, b;
+        auto views = [&](State &s) {
+            std::vector<CcdMotion> result(3);
+            for (int i = 0; i < 3; ++i) {
+                auto &m = result[i];
+                m.transform = &s.transforms[i];
+                m.velocity = &s.velocities[i];
+                m.angular_velocity = &s.angular[i];
+                m.dynamic = true;
+                m.inverse_mass = 1;
+                m.colliders.push_back({&dot, {}, 0.f, 1.f});
+            }
+            s.transforms[0].position = {-5, 0};
+            s.transforms[1].position = {5, 0};
+            s.transforms[2].position = {0, 500};
+            s.velocities[0] = {600, 0};
+            s.velocities[1] = {-600, 0};
+            s.velocities[2] = {600, 0};
+            result[0].bullet = true;
+            return result;
+        };
+        auto independent = views(a), coupled = views(b);
+        auto fast = advance_continuous(independent, .01f);
+        auto reference = advance_continuous_group(coupled, .01f);
+        check(fast.impacts == 1 && reference.impacts == 1 && a.velocities[0].x < 0 &&
+                  a.velocities[1].x > 0 && a.transforms[0].position.x < a.transforms[1].position.x,
+              "a bullet sharing a swept span did not couple to the dynamic body");
+        for (int i = 0; i < 3; ++i)
+            check((a.transforms[i].position - b.transforms[i].position).length() < .0001f &&
+                      (a.velocities[i] - b.velocities[i]).length() < .0001f,
+                  "a bulleted island changed a trajectory");
+        check((a.transforms[2].position - b.transforms[2].position).length() < .0001f &&
+                  a.transforms[2].position.x > 5.9f,
+              "a distant dynamic body lost its time to a bullet");
     }
     std::cout << checks << " CCD checks passed\n";
     return 0;

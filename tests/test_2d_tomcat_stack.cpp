@@ -64,6 +64,9 @@ int main(int argc, char **argv) try {
     double total = 0, sleeping_ms = 0, cache_ms = 0, active_ms = 0, resting_ms = 0;
     std::size_t active_body_steps = 0, projection_candidates = 0, corrections = 0, cached = 0;
     std::size_t projection_fast_rejections = 0;
+    double pairs_ms = 0, narrow_ms = 0, assemble_ms = 0, events_ms = 0;
+    double broadphase_ms = 0, save_ms = 0;
+    std::size_t candidate_pairs = 0, fixture_pairs = 0, narrow_tests = 0, reused_manifolds = 0;
     int active_frames = 0, resting_frames = 0, first_sleep = -1;
     for (int frame = 0; frame < frames; ++frame) {
         int active = 0;
@@ -115,6 +118,16 @@ int main(int argc, char **argv) try {
             projection_candidates += t.projection_candidates;
             corrections += t.position_corrections;
             cached += t.cached_manifolds + t.sleeping_contacts;
+            pairs_ms += t.pairs_ms;
+            narrow_ms += t.narrow_ms;
+            assemble_ms += t.assemble_ms;
+            events_ms += t.events_ms;
+            broadphase_ms += t.broadphase_ms;
+            save_ms += t.save_ms;
+            candidate_pairs += t.candidate_pairs;
+            fixture_pairs += t.fixture_pairs;
+            narrow_tests += t.narrow_tests;
+            reused_manifolds += t.reused_manifolds;
         }
         if (frames > 360 && (frame + 1) % 300 == 0) {
             float speed = 0, angular = 0;
@@ -148,6 +161,14 @@ int main(int argc, char **argv) try {
               << " projection_candidates=" << projection_candidates << " cached_contacts=" << cached
               << " projection_fast_rejections=" << projection_fast_rejections
               << std::endl;
+    std::cout << "PROBE pairs_ms=" << pairs_ms / (frames - 60) << " narrow_ms=" << narrow_ms / (frames - 60)
+              << " assemble_ms=" << assemble_ms / (frames - 60) << " events_ms=" << events_ms / (frames - 60)
+              << " candidate_pairs=" << candidate_pairs / (frames - 60)
+              << " fixture_pairs=" << fixture_pairs / (frames - 60)
+              << " narrow_tests=" << narrow_tests / (frames - 60)
+              << " reused_manifolds=" << reused_manifolds / (frames - 60)
+              << " broadphase_ms=" << broadphase_ms / (frames - 60)
+              << " save_ms=" << save_ms / (frames - 60) << std::endl;
     require(std::abs(w.simulation_time() - frames / 60.0) < 1e-4, "world time lost");
     require(std::abs(probe.transform.position.x - (1000.0f + frames)) < .001f,
             "independent motion time lost");
