@@ -193,13 +193,26 @@ int main() try {
         // a projection candidate. Tens of nanoseconds buys a pose comparison and
         // nothing more, so a regression to a linear scan inside the guard lands
         // two orders of magnitude above it.
+        //
+        // "Tens of nanoseconds" is a claim about optimised code. An unoptimised
+        // build does the same work -- the same comparisons, the same counters --
+        // through real calls instead of inlined ones, and measures about seven
+        // times as much: 560-600 ns per obstacle-frame against 80-110 ns here.
+        // The budget is therefore scaled by configuration rather than fixed. It
+        // still rejects exactly what it is for: the class it guards against sits
+        // two orders of magnitude above *both* figures.
+#ifdef NDEBUG
+        constexpr double kMarginalNsPerObstacleFrame = 300.0;
+#else
+        constexpr double kMarginalNsPerObstacleFrame = 2000.0;
+#endif
         const double marginal_ns =
             (eight_thousand.total_ms - empty.total_ms) * 1.0e6 / (8000.0 * kFrames);
         std::cout << "active tower:   candidates " << two_thousand.candidates << " sweeps "
                   << two_thousand.sweeps << " fast " << two_thousand.fast_rejections << " empty_ms "
                   << empty.total_ms << " worst_ms " << eight_thousand.total_ms
                   << " marginal_ns_per_obstacle_frame " << marginal_ns << '\n';
-        check(marginal_ns < 300.0,
+        check(marginal_ns < kMarginalNsPerObstacleFrame,
               "a parked obstacle costs more than a pose comparison per frame");
     }
     {
