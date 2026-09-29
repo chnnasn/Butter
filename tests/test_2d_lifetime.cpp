@@ -243,6 +243,48 @@ int main() try {
         check(links[4]->transform.position.y < 1.0f && links[4]->transform.position.y > 0.0f,
               "the links cut loose from the chain did not fall to the floor");
     }
+    {
+        // Destroying a fixture must not change the sleep state of the body that
+        // owns it. Box2D's `b2Body::DestroyFixture` destroys the fixture's
+        // contacts and calls `ResetMassData()`; it does not put the body back
+        // into motion. An engine that suspends a body by tearing its fixtures
+        // down and then snapshots the body state reads that state back
+        // immediately, so a wake here is observable as "the body I had asleep
+        // came back awake" rather than as anything to do with the fixture.
+        World w;
+        // `destroy_fixture` takes a real `Fixture`, and the fluent builder makes
+        // legacy single-shape bodies whose `fixtures` list stays empty. Build
+        // explicit fixtures the way the engine does for compound bodies.
+        auto box = [&](BodyType type, Vec2 position, Vec2 half, float friction) -> Body & {
+            Body &body = w.create_empty_body();
+            body.type = type;
+            body.transform.position = position;
+            Fixture definition;
+            definition.shape = Box{half};
+            definition.material.friction = friction;
+            w.add_fixture(body, definition);
+            return body;
+        };
+        box(BodyType::Static, {0, -0.05f}, {20.0f, 0.05f}, 0.6f);
+        Body &lower = box(BodyType::Dynamic, {0, 0.5f}, {0.5f, 0.5f}, 0.5f);
+        Body &upper = box(BodyType::Dynamic, {0, 1.51f}, {0.5f, 0.5f}, 0.5f);
+        for (int frame = 0; frame < 360; ++frame)
+            w.step(kDt);
+        check(lower.sleeping && upper.sleeping, "the resting stack did not fall asleep");
+        check(w.broadphase_candidate_count() >= 2,
+              "the resting stack produced no candidate pairs to tear down");
+
+        Fixture *const fixture = lower.fixtures.front().get();
+        w.destroy_fixture(*fixture);
+        check(lower.fixtures.empty(), "the fixture was not removed from its body");
+        check(lower.sleeping, "destroying a fixture woke the body that owned it");
+        // The body above it did lose a contact, so it is still woken. The change
+        // is about the owner, not about the neighbours.
+        check(!upper.sleeping, "destroying a fixture stopped waking the neighbours");
+        // The owner is still a normal body: only the implicit wake is gone.
+        lower.wake();
+        check(!lower.sleeping, "a body whose fixture was destroyed could not be woken");
+    }
     std::cout << checks << " lifetime checks passed\n";
     return 0;
 } catch (const std::exception &e) {

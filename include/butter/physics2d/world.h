@@ -1070,7 +1070,12 @@ class World {
         // owner, not off the fixture: reaching back through `fixture.body` would
         // read a freed object.
         Body *const body = fixture.body;
-        wake_neighbors(*body);
+        // The body's neighbours still have to be re-solved -- they lost a
+        // contact -- but the body itself must come out of this with the sleep
+        // state it went in with. A fixture edit is not a reason for a sleeping
+        // body to start moving again, and callers that suspend a body by
+        // destroying its fixtures snapshot that state right afterwards.
+        wake_neighbors(*body, /*wake_self=*/false);
         // Only this fixture's contacts go. Everything the body is not touching
         // keeps its manifolds and its accumulated impulses, so destroying one
         // object no longer makes every other stack in the world re-solve from
@@ -3389,30 +3394,43 @@ class World {
             island_groups_[root(i)].push_back(b);
         return island_groups_;
     }
-    void wake_neighbors(Body &body) {
-        if (body.type == BodyType::Dynamic)
+    // Waking a body's neighbours is what keeps a settled island from being left
+    // behind when the world changes underneath it: a body that gains or loses a
+    // contact has to be re-solved. `wake_self` covers the callers whose own body
+    // has to keep the sleep state it already had. Destroying a fixture is one:
+    // Box2D's `b2Body::DestroyFixture` only destroys the contacts and calls
+    // `ResetMassData()`, it does not touch the body's activity, and an engine
+    // that tears a body's fixtures down as part of suspending it reads that
+    // state back immediately afterwards.
+    void wake_neighbors(Body &body, bool wake_self = true) {
+        if (wake_self && body.type == BodyType::Dynamic)
             body.wake();
+        // Only the far end of a constraint or joint is a neighbour; the body
+        // itself is handled above, and only when the caller asked for it.
         auto wake = [&](Body *a, Body *b) {
             if (a != &body && b != &body)
                 return;
-            if (a->type == BodyType::Dynamic)
-                a->wake();
-            if (b->type == BodyType::Dynamic)
-                b->wake();
+            Body *other = a == &body ? b : a;
+            if (other->type == BodyType::Dynamic)
+                other->wake();
         };
         for (auto &c : constraints_)
             wake(c.a, c.b);
         for (auto &j : joints_)
             wake(j->a, j->b);
-        wake_connected();
+        // An island is solved as a unit, so waking a neighbour wakes the island
+        // it belongs to -- except for a body the caller asked to leave alone.
+        wake_connected(wake_self ? nullptr : &body);
     }
-    void wake_connected() {
+    void wake_connected(const Body *skip = nullptr) {
         for (auto &c : constraints_) {
             if (c.a->type == BodyType::Kinematic &&
-                (c.a->velocity.length_squared() > 0 || c.a->angular_velocity != 0) && c.b->sleeping)
+                (c.a->velocity.length_squared() > 0 || c.a->angular_velocity != 0) &&
+                c.b->sleeping && c.b != skip)
                 c.b->wake();
             if (c.b->type == BodyType::Kinematic &&
-                (c.b->velocity.length_squared() > 0 || c.b->angular_velocity != 0) && c.a->sleeping)
+                (c.b->velocity.length_squared() > 0 || c.b->angular_velocity != 0) &&
+                c.a->sleeping && c.a != skip)
                 c.a->wake();
         }
         for (auto &group : islands()) {
@@ -3421,7 +3439,7 @@ class World {
                 awake |= !b->sleeping;
             if (awake)
                 for (auto *b : group)
-                    if (b->sleeping)
+                    if (b->sleeping && b != skip)
                         b->wake();
         }
     }
