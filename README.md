@@ -1,5 +1,7 @@
 # Butter
 
+2026-10-16: Fixed substep force integration and surviving body handles. Added batched queries, solver caching and reproducible Box2D comparisons. See the [validation report (Chinese)](docs/optimization-20261016.md) for implementation limits, unsuccessful experiments and raw measurements.
+
 > **Butter** - Make Physics Smooth Again!
 > A modern, fluent, intuitive C++20 header-only physics engine.
 
@@ -86,6 +88,7 @@ Tests use lightweight assertions and do not depend on third-party frameworks.
 | `test_2d_substeps` | `Config::substeps` buys stacking accuracy and costs nothing when off |
 | `test_2d_solver_options` | Position relaxation, interleaved joints and over-correction guards |
 | `test_2d_lifetime` | Destroying a body disturbs only its own contacts, joints and slots |
+| `test_2d_runtime` | Batched queries, synchronization, CCD bounds and cache/SIMD/parallel equivalence |
 | `test_2d_mesh` | Mesh index cost, boundary-surface contacts, seam normals and two-point manifolds |
 
 Run all tests:
@@ -173,7 +176,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The suite is 20 CTest cases (19 binaries) and passes in both Release and Debug.
+The suite is 28 CTest cases (27 binaries) and passes in both Release and Debug.
 These are repository regressions, separate from the external benchmark below. On
 Windows, inspect the PBD crate stack and explosion demo with:
 

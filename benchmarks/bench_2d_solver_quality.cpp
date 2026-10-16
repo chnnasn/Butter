@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace butter::physics2d;
@@ -390,6 +391,7 @@ constexpr int kSubstepCount = int(sizeof(kSubsteps) / sizeof(kSubsteps[0]));
 
 int main(int argc, char **argv) try {
     const int frames = argc > 1 ? std::atoi(argv[1]) : 600;
+    const bool budgets_only = argc > 2 && std::string(argv[2]) == "--budgets-only";
     if (frames < 60 || frames > 20000)
         throw std::runtime_error("frames must be 60..20000");
 
@@ -474,6 +476,8 @@ int main(int argc, char **argv) try {
         // "how much error does it hide": every configuration runs the same
         // frames over the same scene, and nothing is relaxed to make a number
         // look better -- the accuracy is read off the bodies' own transforms.
+        if (budgets_only)
+            continue;
         std::printf("  arrangement sweep, all measured at iter=%d sub=%d:\n", best_iterations,
                     best_substeps);
         const float stiffnesses[] = {0.0f, 200.0f, 1000.0f};

@@ -2,3 +2,56 @@ foreach(bench_name bench_collision bench_solver bench_2d bench_2d_solver_quality
     add_executable(${bench_name} ${bench_name}.cpp)
     target_link_libraries(${bench_name} PRIVATE butter)
 endforeach()
+
+option(BUTTER_COMPARE_BOX2D "Build the reproducible Box2D 2.4.1 comparison" OFF)
+set(BUTTER_BOX2D_SOURCE_DIR "" CACHE PATH "Existing Box2D 2.4.1 source (no download when set)")
+if(BUTTER_COMPARE_BOX2D)
+    set(BOX2D_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+    set(BOX2D_BUILD_TESTBED OFF CACHE BOOL "" FORCE)
+    set(BOX2D_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    if(NOT BUTTER_BOX2D_SOURCE_DIR)
+        include(FetchContent)
+        FetchContent_Declare(box2d
+            GIT_REPOSITORY https://github.com/erincatto/box2d.git
+            GIT_TAG v2.4.1
+            GIT_SHALLOW TRUE)
+        FetchContent_MakeAvailable(box2d)
+        set(BUTTER_BOX2D_SOURCE_DIR "${box2d_SOURCE_DIR}")
+    else()
+        file(READ "${BUTTER_BOX2D_SOURCE_DIR}/CMakeLists.txt" box2d_project)
+        if(NOT box2d_project MATCHES "project\\(box2d VERSION 2\\.4\\.1\\)")
+            message(FATAL_ERROR "The comparison requires Box2D 2.4.1")
+        endif()
+        add_subdirectory("${BUTTER_BOX2D_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/box2d" EXCLUDE_FROM_ALL)
+    endif()
+    # Fingerprint the actual source, including local modifications. A version
+    # label alone does not identify the code that was measured.
+    file(GLOB_RECURSE box2d_inputs RELATIVE "${BUTTER_BOX2D_SOURCE_DIR}"
+        "${BUTTER_BOX2D_SOURCE_DIR}/include/*.h" "${BUTTER_BOX2D_SOURCE_DIR}/src/*.cpp"
+        "${BUTTER_BOX2D_SOURCE_DIR}/src/*.h")
+    list(SORT box2d_inputs)
+    set(box2d_manifest "")
+    foreach(input IN LISTS box2d_inputs)
+        file(SHA256 "${BUTTER_BOX2D_SOURCE_DIR}/${input}" input_hash)
+        string(APPEND box2d_manifest "${input}:${input_hash}\n")
+    endforeach()
+    string(SHA256 box2d_hash "${box2d_manifest}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/box2d-source.sha256" "${box2d_manifest}")
+    add_executable(bench_2d_compare bench_2d_compare.cpp)
+    find_package(Threads REQUIRED)
+    target_link_libraries(bench_2d_compare PRIVATE butter box2d Threads::Threads)
+    file(GLOB_RECURSE butter_inputs "${PROJECT_SOURCE_DIR}/include/butter/*.h")
+    list(APPEND butter_inputs "${CMAKE_CURRENT_SOURCE_DIR}/bench_2d_compare.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/task_pool.h")
+    list(SORT butter_inputs)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${butter_inputs})
+    set(butter_manifest "")
+    foreach(input IN LISTS butter_inputs)
+        file(SHA256 "${input}" input_hash)
+        file(RELATIVE_PATH input_name "${PROJECT_SOURCE_DIR}" "${input}")
+        string(APPEND butter_manifest "${input_name}:${input_hash}\n")
+    endforeach()
+    string(SHA256 butter_hash "${butter_manifest}")
+    target_compile_definitions(bench_2d_compare PRIVATE
+        BUTTER_BOX2D_HASH="${box2d_hash}" BUTTER_SOURCE_HASH="${butter_hash}" BUTTER_BUILD_CONFIG="$<CONFIG>"
+        BUTTER_COMPILER="${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}")
+endif()

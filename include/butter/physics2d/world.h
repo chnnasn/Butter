@@ -5,8 +5,11 @@
 #include "butter/physics2d/ccd.h"
 #include "butter/physics2d/query.h"
 #include "butter/physics2d/shapes.h"
+#include "butter/physics2d/softness.h"
+#include "butter/physics2d/solver_packet.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -64,6 +67,8 @@ struct Body {
     // Index of this body inside its World. Engine-managed; kept current so the
     // solver can map a body back to a slot in O(1) while building islands.
     std::uint32_t slot{0};
+    // Stable identity slot, independent of the solver's dense storage index.
+    std::uint32_t identity_slot{0};
     // Revision counters, grouped by what they invalidate. See Fixture for the
     // contract: the controlled setters below bump them, direct writes do not
     // and are picked up by the per-step snapshot comparison instead.
@@ -904,6 +909,10 @@ class World {
         // re-detected, and every surviving constraint was rewritten in place
         // instead of the whole set being rebuilt.
         std::size_t refreshed_contact_steps{};
+        std::size_t query_sync_scans{}, joint_filter_checks{};
+        std::size_t solver_island_builds{}, solver_island_reuses{};
+        std::size_t simd_packets{};
+        std::size_t translated_manifolds{};
     };
     struct ContactDiagnostic {
         Body *a{}, *b{};
@@ -945,23 +954,10 @@ class World {
         // the rebuild on its own -- so it exists here to let a test run both
         // ways and compare.
         bool incremental_contacts{true};
-        // Contact compliance, in newtons per metre. 0 makes the velocity pass
-        // solve the normal constraint against its exact effective mass.
-        //
-        // A positive value adds the standard soft-constraint relaxation term,
-        // `gamma = 1 / (dt^2 * stiffness)`, to the diagonal. What that does here
-        // is under-relax the *increment* of the accumulated impulse, because the
-        // compliance that actually supports a load is position error, and this
-        // engine's position pass owns it: the textbook companion term
-        // `-gamma * impulse` makes the constraint a real spring but leaves it
-        // unable to carry a static load at all, and the stack simply falls. So
-        // the honest measurement is that the *column* and *mass ratio* scenes get
-        // worse at equal budget (+72.6% and +406.0% of their own primary metric),
-        // and the scene it helps is a joint chain whose links also touch (-66.7%),
-        // where a relaxed contact stops fighting the pins. Off by default for that
-        // reason, and kept because those numbers are the answer to "should the
-        // contact be made compliant", which is worth being able to reproduce
-        // rather than assert. See benchmarks/bench_2d_solver_quality.cpp.
+        // Legacy impulse under-relaxation (N/m): adds 1/(dt^2*k) to
+        // effective-mass denominators. This is not a spring model. Use
+        // contact_hertz/contact_damping_ratio for experimental soft contacts.
+        // Historical comparisons before the substep-force fix are superseded.
         float contact_stiffness{0};
         // Solve each island's joints inside the contact iteration instead of
         // sweeping every joint after every contact. A joint and a contact that
@@ -985,16 +981,29 @@ class World {
         // Off by default because it is a different solve order, and the default
         // order is what every existing trajectory was recorded against.
         bool interleave_joints{false};
-        // Fraction of a contact's measured overlap that one position sweep
-        // removes. The position pass runs `solver_iterations` times per step, so
-        // a resting stack reaches the overlap at which this fraction and the
-        // sink gravity adds each step balance: the steady penetration of a stack
-        // is proportional to 1 / relaxation. 0.2 is the historical default and
-        // reproduces every existing trajectory bit for bit; raising it trades
-        // jitter in a badly conditioned scene for proportionally less sink, and
-        // costs one multiply per contact per sweep. See
-        // benchmarks/bench_2d_solver_quality.cpp for the measurement.
+        // Fraction of local overlap corrected per positional sweep. The
+        // isolated correction scales linearly; a coupled stack's final error
+        // need not be monotone because rotations/contact topology can change.
         float position_relaxation{0.2f};
+        // Fine-grained clocks inside contact loops are opt-in. Coarse phase
+        // timings and operation counts remain available in either mode.
+        bool detailed_profiling{false};
+        bool cache_solver_islands{true};
+        bool buffered_velocities{true};
+        // Optional host task scheduler. It must invoke each index exactly once
+        // and join all tasks before returning. Only disjoint contact islands
+        // run here; collision queries, callbacks and joints remain serial.
+        std::function<void(std::size_t, const std::function<void(std::size_t)> &)> parallel_for;
+        // Experimental full spring/damper contact solve with a post-integration
+        // unbiased relaxation pass. Zero retains the established rigid solver.
+        float contact_hertz{0};
+        float contact_damping_ratio{1};
+        // Four independent single-point islands per packet. General islands
+        // retain the scalar/block solver; packet execution is opt-in.
+        bool simd_contacts{false};
+        // Conservative local-anchor reuse for axis-aligned box faces moving
+        // only along their contact normal. All other motion uses narrow phase.
+        bool translated_box_contacts{false};
     };
     World() : World(Config{}) {}
     explicit World(const Config &config) : config_(config) {}
@@ -1105,26 +1114,31 @@ class World {
     struct BodyId {
         std::uint32_t index{0xffffffffu};
         std::uint64_t generation{0};
+        std::uint64_t world{0};
         bool valid() const { return index != 0xffffffffu; }
         friend bool operator==(const BodyId &, const BodyId &) = default;
     };
     BodyId id(const Body &body) const {
-        return {body.slot, body.slot < generations_.size() ? generations_[body.slot] : 0};
+        if (!world_identity_ || body.identity_slot >= identities_.size() ||
+            identities_[body.identity_slot].body != &body)
+            return {};
+        return {body.identity_slot, identities_[body.identity_slot].generation, *world_identity_};
     }
     // The body a handle names, or nullptr if the handle predates a destroy.
     Body *body(BodyId handle) {
         if (!alive(handle))
             return nullptr;
-        return bodies_[handle.index].get();
+        return identities_[handle.index].body;
     }
     const Body *body(BodyId handle) const {
         if (!alive(handle))
             return nullptr;
-        return bodies_[handle.index].get();
+        return identities_[handle.index].body;
     }
     bool alive(BodyId handle) const {
-        return handle.index < bodies_.size() && handle.index < generations_.size() &&
-               generations_[handle.index] == handle.generation;
+        return world_identity_ && handle.world == *world_identity_ &&
+               handle.index < identities_.size() && identities_[handle.index].body &&
+               identities_[handle.index].generation == handle.generation;
     }
     void destroy_joint(DistanceJoint &joint) {
         require_unlocked();
@@ -1142,6 +1156,8 @@ class World {
         const std::size_t index = std::size_t(it - bodies_.begin());
         const std::size_t last = bodies_.size() - 1;
         const Body *dead = &body;
+        identities_[body.identity_slot].body = nullptr;
+        free_identities_.push_back(body.identity_slot);
         // 1. Contacts, cached manifolds, accumulated impulses and joints that
         //    touch this body -- and nothing else. The work, and the disturbance,
         //    is confined to this body's neighbourhood.
@@ -1229,17 +1245,12 @@ class World {
         move_slot(pair_stamp_, index, last);
         move_slot(member_stamp_, index, last);
         move_slot(query_stamp_, index, last);
-        move_slot(generations_, index, last);
         move_slot(obstacle_first_proxy_, index, last);
         move_slot(obstacle_transform_, index, last);
         move_slot(obstacle_types_, index, last);
         move_slot(obstacle_fixtures_, index, last);
-        // Any handle to this slot -- the destroyed body's or the one that just
-        // moved in -- is stale from here on. Only a slot that is still there
-        // needs the bump: a slot that was the last one is gone, and the create
-        // that takes its place bumps it again.
-        if (index != last)
-            generations_[index] = ++generation_counter_;
+        // Identity slots do not move with dense solver storage. Only the
+        // destroyed body's handle expires; the survivor keeps its identity.
         compact_proxies_if_needed();
         // Slot-indexed views that are cheaper to invalidate than to move: the CCD
         // collider list holds Fixture pointers, and the next contact build must
@@ -1271,6 +1282,7 @@ class World {
         // New step, new hash epoch: every shape is hashed at most once from here
         // until the next step, however many contacts reference it.
         ++hash_epoch_;
+        refresh_joint_filter();
         auto cache_start = Clock::now();
         invalidate_edited_contacts();
         step_statistics_.cache_ms += milliseconds(cache_start);
@@ -1299,9 +1311,8 @@ class World {
     }
     // One integration/solve window of `step()`.
     //
-    // `first` marks the window that applies this frame's external forces:
-    // gravity plus the accumulated force/torque are frame-level inputs, so
-    // applying them in every window would multiply them by the substep count.
+    // Forces remain constant over the frame and are integrated using each
+    // window's dt. Clear the accumulators only after the final integration.
     // `last` marks the window that publishes contact and trigger transitions,
     // which are still reported once per frame.
     //
@@ -1318,10 +1329,12 @@ class World {
                     (p->force.length_squared() > 0 || p->torque != 0 ||
                      p->velocity.length_squared() > 0 || p->angular_velocity != 0))
                     p->wake();
-                if (p->is_dynamic()) {
-                    p->velocity += (config_.gravity + p->force * p->inverse_mass) * dt;
-                    p->angular_velocity += p->torque * p->inverse_inertia * dt;
-                }
+            }
+            if (p->is_dynamic()) {
+                p->velocity += (config_.gravity + p->force * p->inverse_mass) * dt;
+                p->angular_velocity += p->torque * p->inverse_inertia * dt;
+            }
+            if (last) {
                 p->force = {};
                 p->torque = 0;
             }
@@ -1380,7 +1393,7 @@ class World {
             ++motion_epoch_;
             build_constraints(dt, false);
             build_solver_islands();
-            solve_velocities(dt);
+            solve_velocities(dt, false);
         }
         // Transitions are a frame-level report: they are published once, from
         // the pose the frame ended in. With a single window this is the same
@@ -1476,8 +1489,9 @@ class World {
                     guard_projection(*joint.a, ta);
                     guard_projection(*joint.b, tb);
                 }
-                for (std::size_t k = island.constraint_begin; k < island.constraint_end; ++k)
-                    solve_position(constraints_[island_constraints_[k]]);
+                if (config_.contact_hertz <= 0)
+                    for (std::size_t k = island.constraint_begin; k < island.constraint_end; ++k)
+                        solve_position(constraints_[island_constraints_[k]]);
             }
         }
         step_statistics_.position_ms += milliseconds(position_start);
@@ -1492,7 +1506,41 @@ class World {
     std::size_t joint_count() const { return joints_.size(); }
     std::size_t broadphase_candidate_count() const { return broadphase_candidate_count_; }    // Broad phase accelerated queries. Both refresh the tree first, so they see
     // public transform edits without requiring a step.
+    // Run read-only queries against one synchronized pose. Do not write public
+    // body/fixture fields from the callback; structural mutations are locked.
+    class QueryBatch {
+      public:
+        QueryBatch(const QueryBatch &) = delete;
+        QueryBatch &operator=(const QueryBatch &) = delete;
+        std::vector<Body *> query_aabb(const AABB &area) const {
+            return world_.query_aabb_impl(area, false);
+        }
+        std::optional<RaycastHit> raycast(Vec2 origin, Vec2 direction,
+                float distance = std::numeric_limits<float>::max()) const {
+            return world_.raycast_impl(origin, direction, distance, false);
+        }
+      private:
+        friend class World;
+        explicit QueryBatch(const World &world) : world_(world) {}
+        const World &world_;
+    };
+    template<class Callback> void query_batch(Callback &&callback) {
+        require_unlocked();
+        CallbackLock lock(locked_);
+        if (config_.enable_broadphase)
+            sync_broadphase(true);
+        const QueryBatch batch(*this);
+        callback(batch);
+    }
     std::vector<Body *> query_aabb(const AABB &area) const {
+        return query_aabb_impl(area, true);
+    }
+    std::optional<RaycastHit> raycast(Vec2 origin, Vec2 direction,
+            float distance = std::numeric_limits<float>::max()) const {
+        return raycast_impl(origin, direction, distance, true);
+    }
+  private:
+    std::vector<Body *> query_aabb_impl(const AABB &area, bool synchronize) const {
         std::vector<Body *> result;
         if (!config_.enable_broadphase) {
             for (const auto &body : bodies_)
@@ -1501,7 +1549,8 @@ class World {
             return result;
         }
         // Forced: these calls can arrive between steps, after a public write.
-        sync_broadphase(true);
+        if (synchronize)
+            sync_broadphase(true);
         if (query_stamp_.size() != bodies_.size()) {
             query_stamp_.assign(bodies_.size(), 0);
             query_stamp_value_ = 0;
@@ -1520,8 +1569,7 @@ class World {
         return result;
     }
     std::optional<RaycastHit>
-    raycast(Vec2 origin, Vec2 direction,
-            float max_distance = std::numeric_limits<float>::max()) const {
+    raycast_impl(Vec2 origin, Vec2 direction, float max_distance, bool synchronize) const {
         direction = direction.normalized();
         if (direction.length_squared() == 0 || max_distance < 0)
             return std::nullopt;
@@ -1543,27 +1591,29 @@ class World {
             return best;
         }
         // Forced: a ray cast can arrive between steps, after a public write.
-        sync_broadphase(true);
-        tree_.raycast(origin, direction, max_distance, [&](std::uint32_t payload, float entry) {
+        if (synchronize)
+            sync_broadphase(true);
+        tree_.raycast_clipped(origin, direction, max_distance, [&](std::uint32_t payload, float entry) {
             // Everything behind the closest exact hit can be pruned. The tree's
             // entry distance is measured on the fat box, so it never exceeds the
             // exact distance of any fixture filed under that proxy.
             if (best && entry > best->distance)
-                return true;
+                return best->distance;
             const Proxy &proxy = proxies_[payload];
             const std::size_t index = proxy.body;
             if (index >= bodies_.size())
-                return true;
+                return max_distance;
             if (proxy.fixture == kNoFixture)
                 consider(index, bodies_[index]->shape, bodies_[index]->transform);
             else {
                 const Fixture &fixture = *bodies_[index]->fixtures[proxy.fixture];
                 consider(index, fixture.shape, fixture_transform(fixture));
             }
-            return true;
+            return best ? best->distance : max_distance;
         });
         return best;
     }
+  public:
     std::function<void(Body &, Body &, bool)> on_trigger;
 
   private:
@@ -1905,10 +1955,8 @@ class World {
     bool allowed(const Fixture &a, const Fixture &b) const {
         if (!(a.collision_group & b.collision_mask) || !(b.collision_group & a.collision_mask))
             return false;
-        for (const auto &j : joints_)
-            if (!j->collide_connected &&
-                ((j->a == a.body && j->b == b.body) || (j->a == b.body && j->b == a.body)))
-                return false;
+        if (!joint_collision_allowed(a.body, b.body))
+            return false;
         return !contact_filter || contact_filter(a, b);
     }
     static AABB body_aabb(const Body &b) {
@@ -1929,7 +1977,12 @@ class World {
     }
     using Clock = std::chrono::steady_clock;
     static double milliseconds(Clock::time_point start) {
+        if (start == Clock::time_point{})
+            return 0;
         return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    }
+    Clock::time_point detail_clock() const {
+        return config_.detailed_profiling ? Clock::now() : Clock::time_point{};
     }
     struct ConstraintPoint {
         Vec2 local_a{}, local_b{};
@@ -2078,10 +2131,12 @@ class World {
         }
         // Insert-or-get. The value is default constructed on first use.
         CachedContact &operator[](const ContactKey &key) {
+            if (auto *existing = find(key))
+                return *existing;
             if (slots_.empty())
                 grow(64);
             else if ((size_ + tombstones_ + 1) * 10 >= slots_.size() * 7)
-                grow(slots_.size() * 2);
+                grow((size_ + 1) * 10 >= slots_.size() * 7 ? slots_.size() * 2 : slots_.size());
             return insert(key).value;
         }
         template <class Predicate> void erase_if(Predicate predicate) {
@@ -2188,6 +2243,7 @@ class World {
         Vec2 ra[2], rb[2], tangent;
         float normal_mass[2]{}, tangent_mass[2]{};
         float k01{}, determinant{};
+        float bias[2]{};
         bool movable{};
     };
     std::vector<VelocityGeometry> velocity_geometry_;
@@ -2415,10 +2471,8 @@ class World {
         const std::uint32_t mask_b = fb ? fb->collision_mask : c.b->collision_mask;
         if (!(group_a & mask_b) || !(group_b & mask_a))
             return false;
-        for (const auto &j : joints_)
-            if (!j->collide_connected &&
-                ((j->a == c.a && j->b == c.b) || (j->a == c.b && j->b == c.a)))
-                return false;
+        if (!joint_collision_allowed(c.a, c.b))
+            return false;
         if (!contact_filter)
             return true;
         Fixture legacy_a{}, legacy_b{};
@@ -2535,6 +2589,48 @@ class World {
             return nullptr;
         return &old.c;
     }
+    bool translated_box_cache(const Fixture &a, const Fixture &b, const CachedContact *cached,
+                              Constraint &result) const {
+        if (!config_.translated_box_contacts || !cached || !cached->c.event_contact ||
+            !std::holds_alternative<Box>(a.shape) || !std::holds_alternative<Box>(b.shape))
+            return false;
+        const auto &old = cached->c;
+        if (a.body->transform.angle != 0 || b.body->transform.angle != 0 ||
+            old.detected_a.angle != 0 || old.detected_b.angle != 0 || a.local.angle != 0 || b.local.angle != 0 ||
+            !same_transform(a.local, old.fixture_a) || !same_transform(b.local, old.fixture_b) ||
+            old.default_a != a.body->use_default_shape || old.default_b != b.body->use_default_shape ||
+            current_hash(a) != old.shape_hash_a || current_hash(b) != old.shape_hash_b)
+            return false;
+        const Vec2 da = a.body->transform.position - old.detected_a.position;
+        const Vec2 db = b.body->transform.position - old.detected_b.position;
+        const Vec2 relative = db - da;
+        if (relative.cross(old.normal) != 0)
+            return false;
+        const Vec2 delta = fixture_transform(b).position - fixture_transform(a).position;
+        const Vec2 extent = std::get<Box>(a.shape).half_extents + std::get<Box>(b.shape).half_extents;
+        const Vec2 depth{extent.x - std::abs(delta.x), extent.y - std::abs(delta.y)};
+        const bool x_axis = std::abs(old.normal.x) == 1 && old.normal.y == 0;
+        const bool y_axis = std::abs(old.normal.y) == 1 && old.normal.x == 0;
+        if ((!x_axis && !y_axis) || delta.dot(old.normal) < 0 || depth.x <= 0 || depth.y <= 0 ||
+            (x_axis ? depth.x >= depth.y : depth.y >= depth.x))
+            return false;
+        const float shift = relative.dot(old.normal);
+        for (int k = 0; k < old.manifold.count; ++k)
+            if (old.manifold.points[k].separation + shift > 0 ||
+                old.manifold.points[k].separation + shift < -.02f)
+                return false;
+        result = old;
+        const Vec2 translation = (da + db) * .5f;
+        result.contact.point += translation;
+        result.contact.penetration -= shift;
+        for (int k = 0; k < result.manifold.count; ++k) {
+            result.manifold.points[k].point += translation;
+            result.manifold.points[k].separation += shift;
+        }
+        result.detected_a = a.body->transform;
+        result.detected_b = b.body->transform;
+        return true;
+    }
     // -----------------------------------------------------------------------
     // Resting contacts
     //
@@ -2560,6 +2656,8 @@ class World {
         built_dt_ = dt;
     }
     bool contacts_unchanged(float dt) const {
+        if (joint_filter_changed_)
+            return false;
         if (contact_filter || broadphase_dirty_ || !dirty_bodies_.empty())
             return false;
         // Installing or removing the user filter flips every filter answer at
@@ -2647,11 +2745,11 @@ class World {
         };
         auto *old = contact_cache_.find(contact_key(fa, fb));
         const auto *previous_contact = old;
-        auto t_narrow = Clock::now();
+        auto t_narrow = detail_clock();
         if (auto cached = sleeping_cache(fa, fb, previous_contact)) {
             step_statistics_.narrow_ms += milliseconds(t_narrow);
             ++step_statistics_.reused_manifolds;
-            auto t_build2 = Clock::now();
+            auto t_build2 = detail_clock();
             remember(*cached, previous_contact->points, cached->count);
             (in_place ? *in_place : constraints_.back()).friction =
                 std::sqrt(std::max(0.0f, fa.material.friction * fb.material.friction));
@@ -2666,6 +2764,14 @@ class World {
         Contact contact;
         auto ta = fixture_transform(fa), tb = fixture_transform(fb);
         const auto *geometry = geometry_cache(fa, fb, previous_contact);
+        std::optional<Constraint> translated;
+        if (!geometry && config_.translated_box_contacts) {
+            translated.emplace();
+            if (translated_box_cache(fa, fb, previous_contact, *translated)) {
+                geometry = &*translated;
+                ++step_statistics_.translated_manifolds;
+            }
+        }
         bool touching;
         if (geometry) {
             contact = geometry->contact;
@@ -2677,7 +2783,7 @@ class World {
             touching = test(fa.shape, ta, fb.shape, tb, contact);
         }
         step_statistics_.narrow_ms += milliseconds(t_narrow);
-        auto t_build2 = Clock::now();
+        auto t_build2 = detail_clock();
         bool event_contact = geometry ? geometry->event_contact : touching;
         if (!touching && ccd_detail::supported(fa.shape) && ccd_detail::supported(fb.shape)) {
             auto sep = ccd_detail::separation(fa.shape, ta, fb.shape, tb);
@@ -2791,6 +2897,8 @@ class World {
     // or an event membership that flipped. Those are the cases where the array
     // has to grow or shrink, and they are rare next to a stack settling.
     bool refresh_moved_contacts(float dt, bool warm) {
+        if (joint_filter_changed_)
+            return false;
         if (!config_.incremental_contacts)
             return false;
         if (contact_filter || broadphase_dirty_ || constraints_.empty())
@@ -3010,6 +3118,26 @@ class World {
         std::size_t joint_begin{}, joint_end{};
     };
     void build_solver_islands() {
+        // Exact topology comparison, including active endpoints and dense
+        // indices. Geometry/impulses may change without changing connectivity.
+        island_signature_.clear();
+        island_signature_.push_back({bodies_.size(), active_constraints_.size(), joints_.size(), 0});
+        for (auto index : active_constraints_) {
+            const auto &c = constraints_[index];
+            island_signature_.push_back({index, c.a->slot, c.b->slot,
+                                         std::size_t(c.a->is_dynamic()) + 2 * std::size_t(c.b->is_dynamic())});
+        }
+        for (const auto &j : joints_)
+            island_signature_.push_back({j->a ? j->a->slot : std::size_t(-1),
+                                         j->b ? j->b->slot : std::size_t(-1),
+                                         j->a && j->a->is_dynamic(), j->b && j->b->is_dynamic()});
+        if (config_.cache_solver_islands && island_signature_ == previous_solver_signature_) {
+            ++step_statistics_.solver_island_reuses;
+            step_statistics_.solver_islands = solver_islands_.size();
+            return;
+        }
+        previous_solver_signature_ = island_signature_;
+        ++step_statistics_.solver_island_builds;
         solver_islands_.clear();
         island_constraints_.clear();
         island_joints_.clear();
@@ -3110,10 +3238,17 @@ class World {
         }
         step_statistics_.solver_islands = solver_islands_.size();
     }
-    void solve_velocities(float dt) {
+    ContactSoftness softness_;
+    bool soft_bias_{false};
+    void solve_velocities(float dt, bool use_bias = true) {
         auto start = Clock::now();
+        soft_bias_ = use_bias && config_.contact_hertz > 0;
+        softness_ = soft_bias_ ? ContactSoftness::make(config_.contact_hertz, config_.contact_damping_ratio, dt)
+                              : ContactSoftness{};
         build_velocity_geometry(dt);
-        for (const SolverIsland &island : solver_islands_)
+        begin_velocity_buffer();
+        auto solve_island = [&](std::size_t index) {
+            const auto &island = solver_islands_[index];
             for (int iteration = 0; iteration < config_.solver_iterations; ++iteration) {
                 for (std::size_t k = island.constraint_begin; k < island.constraint_end; ++k)
                     solve_velocity(island_constraints_[k]);
@@ -3127,6 +3262,34 @@ class World {
                         joint.solve(dt);
                 }
             }
+        };
+        if (config_.simd_contacts && velocity_buffer_active_) {
+            std::size_t i = 0;
+            while (i < solver_islands_.size()) {
+                std::array<std::size_t, 4> indices{};
+                bool packet = i + 4 <= solver_islands_.size();
+                for (std::size_t lane = 0; packet && lane < 4; ++lane) {
+                    const auto &island = solver_islands_[i + lane];
+                    packet = island.constraint_end == island.constraint_begin + 1 &&
+                             island.joint_begin == island.joint_end;
+                    if (packet) {
+                        indices[lane] = island_constraints_[island.constraint_begin];
+                        packet = constraints_[indices[lane]].count == 1 && velocity_geometry_[indices[lane]].movable;
+                    }
+                }
+                if (packet) {
+                    for (int iteration = 0; iteration < config_.solver_iterations; ++iteration)
+                        solve_velocity_packet(indices);
+                    ++step_statistics_.simd_packets;
+                    i += 4;
+                } else solve_island(i++);
+            }
+        } else if (config_.parallel_for && velocity_buffer_active_ && solver_islands_.size() > 1)
+            config_.parallel_for(solver_islands_.size(), solve_island);
+        else
+            for (std::size_t i = 0; i < solver_islands_.size(); ++i)
+                solve_island(i);
+        end_velocity_buffer();
         step_statistics_.velocity_ms += milliseconds(start);
     }
     void build_velocity_geometry(float dt) {
@@ -3141,12 +3304,11 @@ class World {
         //
         // A positive `contact_stiffness` relaxes the normal constraint's
         // increment by `K / (K + gamma)` with `gamma = 1 / (dt^2 * stiffness)`.
-        // It is not a spring: see the field's comment in `Config` for why this
-        // engine cannot use one. The friction constraint is relaxed with the
+        // This legacy parameter is not a spring. The friction constraint is relaxed with the
         // same term so the ratio between them stays what the friction
         // coefficient says.
         const float gamma =
-            config_.contact_stiffness > 0 && dt > 0
+            config_.contact_stiffness > 0 && config_.contact_hertz <= 0 && dt > 0
                 ? 1.0f / (dt * dt * config_.contact_stiffness)
                 : 0.0f;
         if (active_constraints_.empty()) {
@@ -3166,6 +3328,14 @@ class World {
                 const auto point = points_.at(std::size_t(c.point_begin + k));
                 g.ra[k] = rotate(point.local_a, rot_a);
                 g.rb[k] = rotate(point.local_b, rot_b);
+                g.bias[k] = 0;
+                if (soft_bias_) {
+                    const float separation = (c.b->center_of_mass(rot_b) + g.rb[k] -
+                                              c.a->center_of_mass(rot_a) - g.ra[k]).dot(c.normal);
+                    g.bias[k] = separation > 0 ? separation / dt :
+                        std::max(-config_.max_position_correction / dt,
+                                 softness_.bias_rate * std::min(0.0f, separation + .001f));
+                }
                 float na = g.ra[k].cross(c.normal), nb = g.rb[k].cross(c.normal),
                       sa = g.ra[k].cross(g.tangent), sb = g.rb[k].cross(g.tangent);
                 g.normal_mass[k] = ma + mb + ia * na * na + ib * nb * nb + gamma;
@@ -3187,7 +3357,7 @@ class World {
         const auto &g = velocity_geometry_[index];
         if (!g.movable)
             return;
-        if (c.count == 2) {
+        if (c.count == 2 && config_.contact_hertz <= 0) {
             Vec2 ra0 = g.ra[0], rb0 = g.rb[0], ra1 = g.ra[1], rb1 = g.rb[1];
             float k00 = g.normal_mass[0], k11 = g.normal_mass[1], k01 = g.k01;
             float det = g.determinant;
@@ -3195,34 +3365,68 @@ class World {
             auto p1 = points_.at(std::size_t(c.point_begin + 1));
             if (det > 1e-8f) {
                 float v0 =
-                    p0.target - (point_velocity(*c.b, rb0) - point_velocity(*c.a, ra0)).dot(c.normal);
+                    p0.target - (solver_point_velocity(*c.b, rb0) - solver_point_velocity(*c.a, ra0)).dot(c.normal);
                 float v1 =
-                    p1.target - (point_velocity(*c.b, rb1) - point_velocity(*c.a, ra1)).dot(c.normal);
+                    p1.target - (solver_point_velocity(*c.b, rb1) - solver_point_velocity(*c.a, ra1)).dot(c.normal);
                 float d0 = (k11 * v0 - k01 * v1) / det, d1 = (k00 * v1 - k01 * v0) / det;
                 if (p0.normal_impulse + d0 >= 0 && p1.normal_impulse + d1 >= 0) {
                     p0.normal_impulse += d0;
                     p1.normal_impulse += d1;
-                    apply(c, ra0, rb0, c.normal * d0);
-                    apply(c, ra1, rb1, c.normal * d1);
+                    solver_apply(c, ra0, rb0, c.normal * d0);
+                    solver_apply(c, ra1, rb1, c.normal * d1);
                 }
             }
         }
         for (int k = 0; k < c.count; ++k) {
             auto p = points_.at(std::size_t(c.point_begin + k));
             Vec2 ra = g.ra[k], rb = g.rb[k];
-            Vec2 rv = point_velocity(*c.b, rb) - point_velocity(*c.a, ra);
+            Vec2 rv = solver_point_velocity(*c.b, rb) - solver_point_velocity(*c.a, ra);
             float denom = g.normal_mass[k];
             float previous = p.normal_impulse;
-            p.normal_impulse =
-                std::max(0.0f, previous + (p.target - rv.dot(c.normal)) / denom);
-            apply(c, ra, rb, c.normal * (p.normal_impulse - previous));
+            const float delta = softness_.mass_scale *
+                (p.target - rv.dot(c.normal) - g.bias[k]) / denom - softness_.impulse_scale * previous;
+            p.normal_impulse = std::max(0.0f, previous + delta);
+            solver_apply(c, ra, rb, c.normal * (p.normal_impulse - previous));
             Vec2 tangent = g.tangent;
-            rv = point_velocity(*c.b, rb) - point_velocity(*c.a, ra);
+            rv = solver_point_velocity(*c.b, rb) - solver_point_velocity(*c.a, ra);
             previous = p.tangent_impulse;
             float limit = c.friction * p.normal_impulse;
             p.tangent_impulse =
                 std::clamp(previous - rv.dot(tangent) / g.tangent_mass[k], -limit, limit);
-            apply(c, ra, rb, tangent * (p.tangent_impulse - previous));
+            solver_apply(c, ra, rb, tangent * (p.tangent_impulse - previous));
+        }
+    }
+    void solve_velocity_packet(const std::array<std::size_t, 4> &indices) {
+        using solver_detail::Lanes;
+        Lanes previous{}, target{}, speed{}, bias{}, mass{}, limit{};
+        for (int lane = 0; lane < 4; ++lane) {
+            const auto index = indices[lane];
+            const auto &c = constraints_[index];
+            const auto &g = velocity_geometry_[index];
+            const auto p = points_.at(std::size_t(c.point_begin));
+            previous[lane] = p.normal_impulse; target[lane] = p.target;
+            speed[lane] = (solver_point_velocity(*c.b, g.rb[0]) - solver_point_velocity(*c.a, g.ra[0])).dot(c.normal);
+            bias[lane] = g.bias[0]; mass[lane] = g.normal_mass[0];
+        }
+        const auto normal = solver_detail::normal_packet(previous, target, speed, bias, mass,
+                                                         softness_.mass_scale, softness_.impulse_scale);
+        for (int lane = 0; lane < 4; ++lane) {
+            auto &c = constraints_[indices[lane]];
+            const auto &g = velocity_geometry_[indices[lane]];
+            auto p = points_.at(std::size_t(c.point_begin));
+            solver_apply(c, g.ra[0], g.rb[0], c.normal * (normal[lane] - previous[lane]));
+            p.normal_impulse = normal[lane];
+            previous[lane] = p.tangent_impulse; mass[lane] = g.tangent_mass[0];
+            limit[lane] = c.friction * normal[lane];
+            speed[lane] = (solver_point_velocity(*c.b, g.rb[0]) - solver_point_velocity(*c.a, g.ra[0])).dot(g.tangent);
+        }
+        const auto tangent = solver_detail::friction_packet(previous, speed, mass, limit);
+        for (int lane = 0; lane < 4; ++lane) {
+            auto &c = constraints_[indices[lane]];
+            const auto &g = velocity_geometry_[indices[lane]];
+            auto p = points_.at(std::size_t(c.point_begin));
+            solver_apply(c, g.ra[0], g.rb[0], g.tangent * (tangent[lane] - previous[lane]));
+            p.tangent_impulse = tangent[lane];
         }
     }
     void guard_projection(Body &body, Transform before, float radius = -1) {
@@ -3475,16 +3679,122 @@ class World {
     friend class BodyBuilder;
     Config config_;
     std::vector<std::unique_ptr<Body>> bodies_;
-    // One generation per slot, bumped whenever the slot changes occupant. Slot
-    // indices are reused, so this is what separates "body 7" from "body 7 after
-    // body 7 was destroyed" -- a `BodyId` that outlives its body resolves to
-    // nullptr instead of to whoever moved in.
-    std::vector<std::uint64_t> generations_;
+    struct Identity { Body *body{}; std::uint64_t generation{}; };
+    std::vector<Identity> identities_;
+    std::vector<std::uint32_t> free_identities_;
+    inline static std::atomic<std::uint64_t> next_world_identity_{1};
+    std::unique_ptr<std::uint64_t> world_identity_{
+        std::make_unique<std::uint64_t>(next_world_identity_.fetch_add(1))};
     std::uint64_t generation_counter_{0};
     std::vector<std::unique_ptr<DistanceJoint>> joints_;
+    std::vector<std::uint64_t> excluded_joint_pairs_;
+    std::vector<std::uint64_t> previous_excluded_joint_pairs_;
+    bool joint_filter_changed_{false};
+    void refresh_joint_filter() {
+        previous_excluded_joint_pairs_.swap(excluded_joint_pairs_);
+        excluded_joint_pairs_.clear();
+        for (const auto &joint : joints_)
+            if (!joint->collide_connected && joint->a && joint->b)
+                excluded_joint_pairs_.push_back(pair_key(std::min(joint->a->identity_slot, joint->b->identity_slot),
+                                                        std::max(joint->a->identity_slot, joint->b->identity_slot)));
+        std::sort(excluded_joint_pairs_.begin(), excluded_joint_pairs_.end());
+        excluded_joint_pairs_.erase(std::unique(excluded_joint_pairs_.begin(), excluded_joint_pairs_.end()),
+                                    excluded_joint_pairs_.end());
+        joint_filter_changed_ = previous_excluded_joint_pairs_ != excluded_joint_pairs_;
+        if (joint_filter_changed_) {
+            auto wake_pair = [&](std::uint64_t key) {
+                const auto [a, b] = unpack_key(key);
+                for (auto index : {a, b})
+                    if (index < identities_.size() && identities_[index].body)
+                        wake_neighbors(*identities_[index].body);
+            };
+            for (auto key : previous_excluded_joint_pairs_)
+                if (!std::binary_search(excluded_joint_pairs_.begin(), excluded_joint_pairs_.end(), key))
+                    wake_pair(key);
+            for (auto key : excluded_joint_pairs_)
+                if (!std::binary_search(previous_excluded_joint_pairs_.begin(), previous_excluded_joint_pairs_.end(), key))
+                    wake_pair(key);
+        }
+    }
+    bool joint_collision_allowed(const Body *a, const Body *b) const {
+        ++step_statistics_.joint_filter_checks;
+        return !std::binary_search(excluded_joint_pairs_.begin(), excluded_joint_pairs_.end(),
+                                   pair_key(std::min(a->identity_slot, b->identity_slot), std::max(a->identity_slot, b->identity_slot)));
+    }
     // Solver islands, rebuilt whenever the active constraint set changes. The
     // scratch arrays live here so a steady step allocates nothing.
     std::vector<SolverIsland> solver_islands_;
+    std::vector<std::array<std::size_t, 4>> island_signature_, previous_solver_signature_;
+    // Compact hot state for contact sweeps. Only participating bodies are
+    // gathered/scattered; cold shape, callback and fixture data stay in Body.
+    struct SolverBody {
+        Vec2 velocity{};
+        float angular_velocity{}, inverse_mass{}, inverse_inertia{};
+    };
+    std::vector<SolverBody> solver_bodies_;
+    std::vector<Body *> solver_body_list_;
+    std::vector<std::uint32_t> solver_body_stamps_;
+    std::uint32_t solver_body_epoch_{0};
+    bool velocity_buffer_active_{false};
+    void begin_velocity_buffer() {
+        velocity_buffer_active_ = config_.buffered_velocities && !config_.interleave_joints;
+        if (!velocity_buffer_active_)
+            return;
+        solver_bodies_.resize(bodies_.size());
+        solver_body_stamps_.resize(bodies_.size(), 0);
+        if (++solver_body_epoch_ == 0) {
+            std::fill(solver_body_stamps_.begin(), solver_body_stamps_.end(), 0);
+            ++solver_body_epoch_;
+        }
+        solver_body_list_.clear();
+        auto gather = [&](Body &b) {
+            if (solver_body_stamps_[b.slot] == solver_body_epoch_)
+                return;
+            solver_body_stamps_[b.slot] = solver_body_epoch_;
+            const bool moving = b.type != BodyType::Static && !b.sleeping;
+            solver_bodies_[b.slot] = {moving ? b.velocity : Vec2{}, moving ? b.angular_velocity : 0,
+                                      inv_mass(b), inv_inertia(b)};
+            solver_body_list_.push_back(&b);
+        };
+        for (auto index : active_constraints_) {
+            gather(*constraints_[index].a);
+            gather(*constraints_[index].b);
+        }
+    }
+    void end_velocity_buffer() {
+        if (!velocity_buffer_active_)
+            return;
+        for (Body *b : solver_body_list_)
+            if (b->is_dynamic()) {
+                b->velocity = solver_bodies_[b->slot].velocity;
+                b->angular_velocity = solver_bodies_[b->slot].angular_velocity;
+            }
+        velocity_buffer_active_ = false;
+    }
+    Vec2 solver_point_velocity(const Body &b, Vec2 r) const {
+        if (!velocity_buffer_active_)
+            return point_velocity(b, r);
+        const auto &s = solver_bodies_[b.slot];
+        return s.velocity + Vec2{-s.angular_velocity * r.y, s.angular_velocity * r.x};
+    }
+    void solver_apply(Constraint &c, Vec2 ra, Vec2 rb, Vec2 impulse) {
+        if (!velocity_buffer_active_) {
+            apply(c, ra, rb, impulse);
+            return;
+        }
+        auto &a = solver_bodies_[c.a->slot];
+        auto &b = solver_bodies_[c.b->slot];
+        // Shared static/kinematic endpoints must remain read-only when islands
+        // are executed concurrently.
+        if (a.inverse_mass > 0) {
+            a.velocity -= impulse * a.inverse_mass;
+            a.angular_velocity -= ra.cross(impulse) * a.inverse_inertia;
+        }
+        if (b.inverse_mass > 0) {
+            b.velocity += impulse * b.inverse_mass;
+            b.angular_velocity += rb.cross(impulse) * b.inverse_inertia;
+        }
+    }
     std::vector<std::size_t> island_constraints_; // positions in active_constraints_
     std::vector<std::size_t> island_joints_;      // indices into joints_
     std::vector<std::size_t> island_root_, island_union_, island_cursor_;
@@ -3878,6 +4188,8 @@ class World {
     // the candidate pair set changed, which is the only case in which the
     // constraint set can differ from the previous step.
     bool sync_broadphase(bool force = false) const {
+        if (force)
+            ++step_statistics_.query_sync_scans;
         const float margin = fat_margin();
         // A changed margin invalidates the padding stored in every fat box.
         if (margin != broadphase_margin_) {
@@ -4107,10 +4419,16 @@ class World {
         Body &ref = *body;
         ref.slot = std::uint32_t(index);
         bodies_.push_back(std::move(body));
-        // A slot is reused as soon as a body is destroyed, so the generation is
-        // what makes a handle an identity: it is bumped every time a slot
-        // changes occupant, and `alive()` compares it.
-        generations_.push_back(++generation_counter_);
+        if (!world_identity_)
+            world_identity_ = std::make_unique<std::uint64_t>(next_world_identity_.fetch_add(1));
+        if (free_identities_.empty()) {
+            ref.identity_slot = std::uint32_t(identities_.size());
+            identities_.push_back({&ref, ++generation_counter_});
+        } else {
+            ref.identity_slot = free_identities_.back();
+            free_identities_.pop_back();
+            identities_[ref.identity_slot] = {&ref, ++generation_counter_};
+        }
         // Appending needs an entry in every per-slot view, but only this body's
         // proxies and candidate list have to be derived: a world that creates
         // and destroys bodies pays for what it added, not for what exists.

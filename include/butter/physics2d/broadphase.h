@@ -111,7 +111,6 @@ class DynamicTree {
             stack.pop_back();
             if (!nodes_[index].box.overlaps(box))
                 continue;
-            if (nodes_[index].leaf())
             if (nodes_[index].leaf()) {
                 if (fatten(nodes_[index].tight, margin).overlaps(box))
                     visit(nodes_[index].payload);
@@ -152,6 +151,14 @@ class DynamicTree {
     // which lets a caller prune everything behind the closest exact hit.
     template <class Visitor>
     void raycast(Vec2 origin, Vec2 direction, float max_distance, Visitor &&visit) const {
+        raycast_clipped(origin, direction, max_distance, [&](std::uint32_t payload, float entry) {
+            return visit(payload, entry) ? max_distance : -1.0f;
+        });
+    }
+    // Return a reduced maximum distance from the callback to prune internal
+    // nodes too. A negative result terminates traversal; zero is a valid hit.
+    template <class Visitor>
+    void raycast_clipped(Vec2 origin, Vec2 direction, float max_distance, Visitor &&visit) const {
         if (root_ == null_node)
             return;
         auto &stack = ray_stack_;
@@ -164,8 +171,10 @@ class DynamicTree {
             if (distance > max_distance)
                 continue;
             if (nodes_[index].leaf()) {
-                if (!visit(nodes_[index].payload, distance))
+                const float limit = visit(nodes_[index].payload, distance);
+                if (limit < 0)
                     return;
+                max_distance = std::min(max_distance, limit);
                 continue;
             }
             const std::uint32_t child1 = nodes_[index].child1, child2 = nodes_[index].child2;

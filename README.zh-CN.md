@@ -5,6 +5,8 @@
 
 [English](README.md)
 
+2026-10-16：已修复多子步外力积分和刚体句柄失效问题，加入批量查询、求解缓存及可复现的 Box2D 对照。实现边界、实验失败结果和原始数据见[本轮验收报告](docs/optimization-20261016.md)。
+
 ## 简介
 
 Butter 追求像 C#/TypeScript 一样流畅的 API，同时保持 C++ 的高性能和零开销抽象。
@@ -86,6 +88,7 @@ ctest --test-dir build
 | `test_2d_substeps` | `Config::substeps` 买到的堆叠精度，以及关闭时零代价 |
 | `test_2d_solver_options` | 位置松弛、关节交错求解与过修正保护 |
 | `test_2d_lifetime` | 销毁刚体只影响它自己的接触、关节与槽位 |
+| `test_2d_runtime` | 批量查询、稳定同步、CCD 包围盒与缓存/SIMD/并行路径对照 |
 | `test_2d_mesh` | 网格索引开销、边界表面接触、接缝法线与双点流形 |
 
 运行全部测试：
@@ -170,7 +173,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-当前测试套件共 20 个 CTest 用例（19 个测试程序），Release、Debug 均通过。
+当前测试套件共 28 个 CTest 用例（27 个测试程序），Release、Debug 均通过。
 这些是仓库回归测试，与下方外部基准测试分开记录。Windows 下查看 PBD 箱子堆和爆炸示例：
 
 ```powershell

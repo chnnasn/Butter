@@ -1,0 +1,47 @@
+frames=600  (all bodies force-awake every frame; nothing else is relaxed)
+Each cell is measured over the full 600 frames of the same scene.
+
+scenario=tall_stack  primary=compression_mm (lower is better)  secondary=drift_mm
+  sub\it                      2                      4                      8                     16
+            primary          ms    primary          ms    primary          ms    primary          ms
+       1 18999.6670       34.88 10450.0217       37.01  4970.8548       49.15    21.9517       78.70
+       2 18999.4095       69.82   105.5450       68.45    19.7277       99.70    19.4435      150.56
+       4    25.8427      107.01    19.0697      134.19    19.4492      190.99    19.6476      276.71
+  second             21166.5630             14675.3025             12241.4112               106.3610   (sub=1)
+  best primary=19.0697 at iter=4 sub=4 | within 1%, cheapest = iter=4 sub=4 at 134.19 ms
+
+scenario=mass_ratio  primary=heavy_drop_mm (lower is better)  secondary=floor_penetration_mm
+  sub\it                      2                      4                      8                     16
+            primary          ms    primary          ms    primary          ms    primary          ms
+       1  9999.7741       17.06  9999.5883       25.90  9180.0561       36.78  9999.9685       46.94
+       2  9999.7869       42.58  9999.2562       52.60    36.6678       62.12    16.0675       97.44
+       4  9900.7292       69.35    42.4061       86.29    14.7810      115.60    13.4945      186.00
+  second                 0.1055                 0.1040                 0.1068                 0.1077   (sub=1)
+  best primary=13.4945 at iter=16 sub=4 | within 1%, cheapest = iter=16 sub=4 at 186.00 ms
+
+scenario=joint_chain  primary=steady_gap_mm (lower is better)  secondary=worst_gap_mm
+  sub\it                      2                      4                      8                     16
+            primary          ms    primary          ms    primary          ms    primary          ms
+       1    25.7854       30.94     2.2268       47.34     0.0377       81.51     0.0057      141.40
+       2     1.4973       78.33     0.0215      122.56     0.0062      182.04     0.0081      291.44
+       4     0.0110      203.76     0.0052      254.16     0.0072      366.00     0.0086      577.13
+  second                80.5883                37.7121                17.2968                 7.7147   (sub=1)
+  best primary=0.0052 at iter=4 sub=4 | within 1%, cheapest = iter=4 sub=4 at 254.16 ms
+
+scenario=moving_platform  primary=sink_mm (lower is better)  secondary=slide_mm
+  sub\it                      2                      4                      8                     16
+            primary          ms    primary          ms    primary          ms    primary          ms
+       1     0.0409       17.21     0.0901       23.60     0.0499       15.59     0.0012       23.28
+       2     0.0820       30.72     0.0919       31.79     0.0141       41.61     0.0004       49.16
+       4     0.1039       51.83     0.0321       66.05     0.0034       99.05     0.0000       98.67
+  second               162.5384               161.7894               161.5293               161.4981   (sub=1)
+  best primary=0.0000 at iter=16 sub=4 | within 1%, cheapest = iter=16 sub=4 at 98.67 ms
+
+scenario=fast_spin  primary=penetration_mm (lower is better)  secondary=residual_spin_mrad_s
+  sub\it                      2                      4                      8                     16
+            primary          ms    primary          ms    primary          ms    primary          ms
+       1     0.0982        1.53     0.0970        3.16     0.0710        2.06     0.0701        2.74
+       2     0.0776        3.21     0.0604        6.48     0.0445       13.96     0.0447       26.29
+       4     0.0000        5.60     0.0603       15.62     0.0542        8.86     0.0535       12.32
+  second                 0.0000                 0.0000                 0.0000                 0.0000   (sub=1)
+  best primary=0.0000 at iter=2 sub=4 | within 1%, cheapest = iter=2 sub=4 at 5.60 ms

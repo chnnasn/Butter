@@ -1,5 +1,7 @@
 # Serial 2D solver optimization
 
+> Correction, 2026-10-16: Historical multi-substep experiments on this page applied only `1/substeps` of the frame's external force. Multi-substep results and related stiffness/relaxation comparisons require remeasurement; single-substep forces are unaffected. Historical records remain for traceability. See the [fix and validation report (Chinese)](optimization-20261016.md).
+
 [中文](serial-optimization.zh-CN.md)
 
 This follow-up builds on `ea8ef90`. It preserves the CCD impact budget, geometric

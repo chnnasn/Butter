@@ -1,0 +1,4 @@
+compiler=MSVC-19.50.35724.0 config=Release box2d=2.4.1 source_sha256=8b100c936f5e87d6adcd440d3686a7a996845f1c6305d49d2d5150e50dcb1993 butter_sha256=e6f63184755915cc24a096ae9c6ace9f4d499052a8545dfd8c3519effe36306e dt=1/60 warmup=60
+Butter position iterations=velocity iterations; Box2D position iterations=3. Equal settings are not equal quality.
+cpp_new excludes aligned allocation, malloc and Box2D block allocator; CCD limits unavailable for Box2D.
+Box2D polygon skin is its default 0.01m; outline height error includes skin gaps. Quality gates: floor<=25mm, fast wall<=1mm, joint<=50mm, stack height error<=0.5m.

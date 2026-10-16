@@ -1,6 +1,15 @@
-foreach(test_name test_math test_body test_collision test_world test_features test_pbd test_triggers test_shapes test_broadphase test_2d test_2d_ccd test_2d_engine test_3d_namespace test_2d_stability test_2d_tomcat_stack test_2d_optimization test_2d_mass test_2d_broadphase test_2d_joints test_2d_substeps test_2d_capsule test_2d_obstacles test_2d_contact_refresh test_2d_solver_options test_2d_lifetime test_2d_mesh)
+foreach(test_name test_math test_body test_collision test_world test_features test_pbd test_triggers test_shapes test_broadphase test_2d test_2d_ccd test_2d_engine test_3d_namespace test_2d_stability test_2d_tomcat_stack test_2d_optimization test_2d_mass test_2d_broadphase test_2d_joints test_2d_substeps test_2d_capsule test_2d_obstacles test_2d_contact_refresh test_2d_solver_options test_2d_lifetime test_2d_mesh test_2d_runtime)
     add_executable(${test_name} ${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE butter)
+    # Test assertions must execute in Release as well as Debug.
+    if(MSVC)
+        target_compile_options(${test_name} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${test_name} PRIVATE -UNDEBUG)
+    endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 add_test(NAME test_2d_tomcat_circles COMMAND test_2d_tomcat_stack 1000 circles)
+
+find_package(Threads REQUIRED)
+target_link_libraries(test_2d_runtime PRIVATE Threads::Threads)

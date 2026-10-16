@@ -32,6 +32,7 @@ struct CcdSettings {
     int max_impacts{32}; // Per moving body, not per world.
     int max_iterations{64};
     float tolerance{0.0001f};
+    bool tight_fixture_bounds{true};
 };
 enum class CcdFailure { ImpactBudget, NonConvergence, ZeroTimeRepeat };
 struct CcdDiagnostic {
@@ -43,6 +44,7 @@ struct CcdDiagnostic {
 struct CcdStatistics {
     int impacts{};
     std::size_t sweeps{};
+    std::size_t fixture_bounds_rejections{};
     std::size_t persistent_contacts{}; // Whole remaining trajectory certified on a contact plane.
     std::size_t bounds_tests{};
     // Overlap tests against stationary geometry, which is enumerated through its
@@ -65,6 +67,7 @@ struct CcdStatistics {
     void accumulate(const CcdStatistics &window) {
         impacts += window.impacts;
         sweeps += window.sweeps;
+        fixture_bounds_rejections += window.fixture_bounds_rejections;
         persistent_contacts += window.persistent_contacts;
         bounds_tests += window.bounds_tests;
         stationary_tests += window.stationary_tests;
@@ -342,6 +345,22 @@ inline AABB swept_bounds(const Shape &s, const ShapeSweep &sweep) {
              std::min(sweep.start.position.y, sweep.end.position.y) - r},
             {std::max(sweep.start.position.x, sweep.end.position.x) + r,
              std::max(sweep.start.position.y, sweep.end.position.y) + r}};
+}
+// An envelope for every fixture point over the whole interval. Translation
+// is bounded by the endpoint union; rotation adds a chord-length upper bound.
+// This is a proof of separation, never a displacement-based CCD disable switch.
+inline AABB tight_swept_bounds(const Shape &shape, const ShapeSweep &sweep, float tolerance) {
+    const auto a = compute_aabb(shape, sweep.at(0));
+    const auto b = compute_aabb(shape, sweep.at(1));
+    const float angle = std::abs(sweep.end.angle - sweep.start.angle);
+    const float reach = radius(shape) + sweep.local.position.length();
+    const float roundoff = 16 * std::numeric_limits<float>::epsilon() *
+        std::max({1.0f, std::abs(a.min.x), std::abs(a.min.y), std::abs(a.max.x),
+                  std::abs(a.max.y), std::abs(b.min.x), std::abs(b.min.y),
+                  std::abs(b.max.x), std::abs(b.max.y)});
+    const float pad = reach * std::min(angle, 2.0f) + tolerance + roundoff;
+    return {{std::min(a.min.x, b.min.x) - pad, std::min(a.min.y, b.min.y) - pad},
+            {std::max(a.max.x, b.max.x) + pad, std::max(a.max.y, b.max.y) + pad}};
 }
 } // namespace ccd_detail
 
@@ -741,6 +760,13 @@ inline CcdStatistics advance_continuous_group(std::vector<CcdMotion> &bodies, fl
                             if (fx.trigger || fy.trigger || !(fx.group & fy.mask) ||
                                 !(fy.group & fx.mask) || (filter && !filter(fx, fy)))
                                 continue;
+                            if (settings.tight_fixture_bounds &&
+                                ccd_detail::supported(*fx.shape) && ccd_detail::supported(*fy.shape) &&
+                                !ccd_detail::tight_swept_bounds(*fx.shape, x.sweep(remaining, fx), settings.tolerance)
+                                    .overlaps(ccd_detail::tight_swept_bounds(*fy.shape, y.sweep(remaining, fy), settings.tolerance))) {
+                                ++stats.fixture_bounds_rejections;
+                                continue;
+                            }
                             ++stats.sweeps;
                             auto hit = sweep_shapes(*fx.shape, x.sweep(remaining, fx), *fy.shape,
                                                     y.sweep(remaining, fy), settings);

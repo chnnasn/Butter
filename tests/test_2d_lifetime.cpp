@@ -95,6 +95,23 @@ float max_delta(const std::vector<float> &a, const std::vector<float> &b) {
 int main() try {
     std::cout.setf(std::ios_base::unitbuf); // So a crash still shows how far the checks got.
     {
+        World w, other;
+        auto &first = w.create_body().build();
+        auto &survivor = w.create_body().build();
+        const auto handle = w.id(survivor);
+        auto &foreign = other.create_body().build();
+        check(!w.alive(other.id(foreign)), "cross-world handle was accepted");
+        check(!w.id(foreign).valid(), "foreign body acquired a local identity");
+        w.destroy_body(first);
+        check(w.body(handle) == &survivor && w.id(survivor) == handle,
+              "deleting an unrelated body invalidated survivor identity");
+        World moved = std::move(w);
+        check(moved.body(handle) == &survivor, "moving a world invalidated identity");
+        auto &replacement = w.create_body().build();
+        check(!w.alive(handle) && !moved.alive(w.id(replacement)),
+              "moved-from world reused the moved world's identity");
+    }
+    {
         // A handle is an identity, not an index. The slot is reused, so the
         // thing that makes a stale handle detectable is the generation.
         World w;
